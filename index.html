@@ -240,10 +240,12 @@ const fmtWeek  = wk => { const d=new Date(wk+"T00:00:00"),end=new Date(d); end.s
 const fmtMonth = key => { const [y,m]=key.split("-"); return new Date(+y,+m-1,1).toLocaleString("default",{month:"long",year:"numeric"}); };
 
 // Calculate employee pay for a job
-function calcEmpPay(empType, empRate, revenue, minutes){
+// % and flat are based on gross profit (revenue - job cost), not raw revenue
+function calcEmpPay(empType, empRate, revenue, minutes, cost=0){
   if(empType==="None" || !empRate) return 0;
+  const grossProfit = Math.max(0, revenue - cost);
   if(empType==="Per Job (flat)") return empRate;
-  if(empType==="Per Job (%)") return revenue * (empRate/100);
+  if(empType==="Per Job (%)") return grossProfit * (empRate/100);
   if(empType==="Hourly") return (minutes/60) * empRate;
   return 0;
 }
@@ -253,22 +255,35 @@ function calcMonthlyExpenses(expenses){
   return (expenses||[]).filter(e=>e.active).reduce((s,e)=>s+Number(e.amount),0);
 }
 
-// True net profit for a single job (after job costs and employee pay)
-function jobNet(e, settings){
-  const emp1 = calcEmpPay(settings.emp1Type, settings.emp1Rate, e.revenue, e.minutes);
-  const emp2 = calcEmpPay(settings.emp2Type, settings.emp2Rate, e.revenue, e.minutes);
-  const manualEmp1 = e.emp1Pay||0;
-  const manualEmp2 = e.emp2Pay||0;
-  // Use manual if provided, otherwise auto-calculate
-  const p1 = manualEmp1>0 ? manualEmp1 : emp1;
-  const p2 = manualEmp2>0 ? manualEmp2 : emp2;
-  return (e.revenue - e.cost) - p1 - p2;
+// Daily overhead = total monthly expenses / days in month
+function dailyOverhead(settings){
+  return calcMonthlyExpenses(settings.expenses) / DAYS_IN_MONTH;
+}
+
+// Build a map of { date: overheadAllocatedPerJob }
+// Each working day gets one full day of overhead split evenly across all jobs that day
+function buildDailyAllocMap(entries, settings){
+  const overhead = dailyOverhead(settings);
+  const countByDate = {};
+  entries.forEach(e=>{ countByDate[e.date] = (countByDate[e.date]||0) + 1; });
+  const allocMap = {};
+  Object.keys(countByDate).forEach(date=>{
+    allocMap[date] = overhead / countByDate[date];
+  });
+  return allocMap;
 }
 
 function totalEmpPay(e, settings){
-  const emp1 = e.emp1Pay>0 ? e.emp1Pay : calcEmpPay(settings.emp1Type, settings.emp1Rate, e.revenue, e.minutes);
-  const emp2 = e.emp2Pay>0 ? e.emp2Pay : calcEmpPay(settings.emp2Type, settings.emp2Rate, e.revenue, e.minutes);
+  const emp1 = e.emp1Pay>0 ? e.emp1Pay : calcEmpPay(settings.emp1Type, settings.emp1Rate, e.revenue, e.minutes, e.cost);
+  const emp2 = e.emp2Pay>0 ? e.emp2Pay : calcEmpPay(settings.emp2Type, settings.emp2Rate, e.revenue, e.minutes, e.cost);
   return emp1 + emp2;
+}
+
+// True net profit for a single job including daily overhead allocation
+function jobNet(e, settings, allocMap){
+  const ep = totalEmpPay(e, settings);
+  const overhead = allocMap ? (allocMap[e.date]||0) : 0;
+  return (e.revenue - e.cost) - ep - overhead;
 }
 
 // ── Firebase ──
@@ -315,14 +330,14 @@ function buildReport(type, entries, settings){
   L.push("");
   if(settings.emp1Type!=="None"||settings.emp2Type!=="None"){
     L.push("EMPLOYEE PAY"); L.push("─".repeat(46));
-    if(settings.emp1Type!=="None") L.push(`${settings.emp1Name}: ${cur(subset.reduce((s,e)=>s+(e.emp1Pay>0?e.emp1Pay:calcEmpPay(settings.emp1Type,settings.emp1Rate,e.revenue,e.minutes)),0))}`);
-    if(settings.emp2Type!=="None") L.push(`${settings.emp2Name}: ${cur(subset.reduce((s,e)=>s+(e.emp2Pay>0?e.emp2Pay:calcEmpPay(settings.emp2Type,settings.emp2Rate,e.revenue,e.minutes)),0))}`);
+    if(settings.emp1Type!=="None") L.push(`${settings.emp1Name}: ${cur(subset.reduce((s,e)=>s+(e.emp1Pay>0?e.emp1Pay:calcEmpPay(settings.emp1Type,settings.emp1Rate,e.revenue,e.minutes,e.cost)),0))}`);
+    if(settings.emp2Type!=="None") L.push(`${settings.emp2Name}: ${cur(subset.reduce((s,e)=>s+(e.emp2Pay>0?e.emp2Pay:calcEmpPay(settings.emp2Type,settings.emp2Rate,e.revenue,e.minutes,e.cost)),0))}`);
     L.push("");
   }
   const svcMap={};
-  subset.forEach(e=>{ if(!svcMap[e.service])svcMap[e.service]={jobs:0,rev:0,net:0}; svcMap[e.service].jobs++;svcMap[e.service].rev+=e.revenue;svcMap[e.service].net+=jobNet(e,settings); });
+  const subAllocMap=buildDailyAllocMap(subset,settings); subset.forEach(e=>{ if(!svcMap[e.service])svcMap[e.service]={jobs:0,rev:0,net:0}; svcMap[e.service].jobs++;svcMap[e.service].rev+=e.revenue;svcMap[e.service].net+=jobNet(e,settings,subAllocMap); });
   if(Object.keys(svcMap).length>0){ L.push("BY SERVICE"); L.push("─".repeat(46)); Object.entries(svcMap).sort((a,b)=>b[1].rev-a[1].rev).forEach(([s,d])=>{ L.push(`${s.replace("Mobile ","")}: ${d.jobs} jobs | Rev ${cur(d.rev)} | Net ${cur(d.net)}`); }); L.push(""); }
-  if(subset.length>0){ L.push("JOB LIST"); L.push("─".repeat(46)); subset.sort((a,b)=>a.date.localeCompare(b.date)).forEach((e,i)=>{ const ep=totalEmpPay(e,settings); L.push(`${i+1}. ${e.date} | ${e.service.replace("Mobile ","")}`); if(e.customerName)L.push(`   Customer: ${e.customerName}${e.customerPhone?" — "+e.customerPhone:""}`); L.push(`   Rev: ${cur(e.revenue)} | Cost: ${cur(e.cost)} | Emp Pay: ${cur(ep)} | Net: ${cur(jobNet(e,settings))}`); if(e.note)L.push(`   Note: ${e.note}`); L.push(""); }); }
+  if(subset.length>0){ L.push("JOB LIST"); L.push("─".repeat(46)); subset.sort((a,b)=>a.date.localeCompare(b.date)).forEach((e,i)=>{ const ep=totalEmpPay(e,settings); L.push(`${i+1}. ${e.date} | ${e.service.replace("Mobile ","")}`); if(e.customerName)L.push(`   Customer: ${e.customerName}${e.customerPhone?" — "+e.customerPhone:""}`); L.push(`   Rev: ${cur(e.revenue)} | Cost: ${cur(e.cost)} | Emp Pay: ${cur(ep)} | Net: ${cur(jobNet(e,settings,subAllocMap))}`); if(e.note)L.push(`   Note: ${e.note}`); L.push(""); }); }
   L.push("━".repeat(46)); L.push("Wheel Rush Mobile Tire Repair"); L.push("305-897-7030 | wheelrush.net");
   return L.join("\n");
 }
@@ -387,18 +402,18 @@ function HomeScreen({entries, setTab, dashTab, setDashTab, settings, syncStatus}
   const grossProfit=totalRev-totalCost;
   const totalMiles=entries.reduce((s,e)=>s+(e.mileage||0),0);
   const monthlyExpTotal=calcMonthlyExpenses(settings.expenses);
-  // Monthly fixed expenses prorated across all time
-  const uniqueMonths=[...new Set(entries.map(e=>e.date.slice(0,7)))].length||1;
-  const totalFixedExp=monthlyExpTotal*uniqueMonths;
-  const netProfit=grossProfit-totalEmp-totalFixedExp;
+  // Net profit on overview = gross profit minus employee pay only (no fixed expenses)
+  const netProfit=grossProfit-totalEmp;
   const margin=totalRev>0?((grossProfit/totalRev)*100).toFixed(1):"0.0";
   const avgRev=entries.length?totalRev/entries.length:0;
 
-  // This month
+  // This month — also exclude fixed expenses from overview net
   const mE=entries.filter(e=>e.date.startsWith(nowKey));
   const mRev=mE.reduce((s,e)=>s+e.revenue,0), mCost=mE.reduce((s,e)=>s+e.cost,0);
   const mEmp=mE.reduce((s,e)=>s+totalEmpPay(e,settings),0);
-  const mGross=mRev-mCost, mNet=mGross-mEmp-monthlyExpTotal;
+  const mGross=mRev-mCost, mNet=mGross-mEmp;
+  // Full net (with expenses) only used in Expenses tab
+  const mNetFull=mGross-mEmp-monthlyExpTotal;
 
   // This week
   const wkE=entries.filter(e=>weekStart(e.date)===thisWeekKey);
@@ -424,7 +439,7 @@ function HomeScreen({entries, setTab, dashTab, setDashTab, settings, syncStatus}
       ):(
         <>
           <div className="tabs">
-            {[["overview","Overview"],["weekly","Weekly"],["monthly","Monthly"]].map(([t,l])=>(
+            {[["overview","Overview"],["weekly","Weekly"],["monthly","Monthly"],["employees","Employees"],["expenses","Expenses"]].map(([t,l])=>(
               <button key={t} className={`tab${dashTab===t?" active":""}`} onClick={()=>setDashTab(t)}>{l}</button>
             ))}
           </div>
@@ -449,25 +464,10 @@ function HomeScreen({entries, setTab, dashTab, setDashTab, settings, syncStatus}
             <div className="kpi-grid" style={{marginTop:12}}>
               <div className="kpi-card"><div className="kpi-label">Total Revenue</div><div className="kpi-value big">{cur(totalRev)}</div></div>
               <div className="kpi-card"><div className="kpi-label">Gross Profit</div><div className="kpi-value big">{cur(grossProfit)}</div></div>
-              <div className="kpi-card accent"><div className="kpi-label white">Net Profit (after all)</div><div className={`kpi-value big ${netProfit>=0?"green":"red"}`}>{cur(netProfit)}</div></div>
+              <div className="kpi-card accent"><div className="kpi-label white">Net Profit (after emp)</div><div className={`kpi-value big ${netProfit>=0?"green":"red"}`}>{cur(netProfit)}</div></div>
               <div className="kpi-card"><div className="kpi-label">Gross Margin</div><div className="kpi-value">{margin}%</div></div>
               <div className="kpi-card"><div className="kpi-label">Total Jobs</div><div className="kpi-value">{entries.length}</div></div>
               <div className="kpi-card"><div className="kpi-label">Avg Job Revenue</div><div className="kpi-value">{cur(avgRev)}</div></div>
-            </div>
-
-            {/* This month cost breakdown */}
-            <div className="breakdown-card" style={{marginTop:14,margin:"14px 14px 0"}}>
-              <div className="breakdown-title">This Month — Profit Breakdown</div>
-              <div className="breakdown-row"><span className="breakdown-label">Revenue</span><span className="breakdown-val">{cur(mRev)}</span></div>
-              <div className="breakdown-row"><span className="breakdown-label">Job Costs (parts/supplies)</span><span className="breakdown-val red">−{cur(mCost)}</span></div>
-              <div className="breakdown-row"><span className="breakdown-label">Employee Pay</span><span className="breakdown-val red">−{cur(mEmp)}</span></div>
-              {(settings.expenses||[]).filter(e=>e.active).map(e=>(
-                <div key={e.id} className="breakdown-row"><span className="breakdown-label">{e.name}</span><span className="breakdown-val red">−{cur(e.amount)}</span></div>
-              ))}
-              <div className="breakdown-total">
-                <span className="breakdown-total-label">Net Profit This Month</span>
-                <span className={`breakdown-total-val ${mNet>=0?"green":"red"}`}>{cur(mNet)}</span>
-              </div>
             </div>
 
             {/* This week / month */}
@@ -495,8 +495,9 @@ function HomeScreen({entries, setTab, dashTab, setDashTab, settings, syncStatus}
 
             {/* Recent jobs */}
             <div className="section-header"><span className="section-title">Recent Jobs</span><button className="section-link btn" onClick={()=>setTab("history")}>View all</button></div>
-            {entries.slice(0,5).map(e=>{
-              const ep=totalEmpPay(e,settings), net=jobNet(e,settings);
+            {(()=>{ const am=buildDailyAllocMap(entries,settings); return entries.slice(0,5).map(e=>{
+              const ep=totalEmpPay(e,settings), net=jobNet(e,settings,am);
+              const dayOH=am[e.date]||0;
               return (
                 <div key={e.id} className="job-card">
                   <div className="job-icon">{ICONS[e.service]||"⚙️"}</div>
@@ -509,11 +510,218 @@ function HomeScreen({entries, setTab, dashTab, setDashTab, settings, syncStatus}
                     <div className="job-revenue">{cur(e.revenue)}</div>
                     <div className="job-net" style={{color:net>=0?"#555":"#ef4444"}}>net {cur(net)}</div>
                     {ep>0&&<div style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:10,color:"#aaa"}}>emp {cur(ep)}</div>}
+                    {dayOH>0&&<div style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:10,color:"#bbb"}}>ovhd {cur(dayOH)}</div>}
                   </div>
                 </div>
               );
-            })}
+            }); })()}
           </>}
+
+          {/* ── EXPENSES TAB ── */}
+          {dashTab==="expenses" && (
+            <div style={{padding:"14px 14px 20px"}}>
+
+              {/* Monthly P&L this month */}
+              <div className="breakdown-card" style={{marginBottom:16}}>
+                <div className="breakdown-title">This Month — Full P&L</div>
+                <div className="breakdown-row"><span className="breakdown-label">Revenue</span><span className="breakdown-val">{cur(mRev)}</span></div>
+                <div className="breakdown-row"><span className="breakdown-label">Job Costs (parts/supplies)</span><span className="breakdown-val red">−{cur(mCost)}</span></div>
+                <div className="breakdown-row" style={{borderBottom:"1px solid #f5f5f5",paddingBottom:4}}><span className="breakdown-label" style={{fontWeight:600}}>Gross Profit</span><span className="breakdown-val">{cur(mGross)}</span></div>
+                {mEmp>0&&<div className="breakdown-row"><span className="breakdown-label">Employee Pay</span><span className="breakdown-val red">−{cur(mEmp)}</span></div>}
+                {(settings.expenses||[]).filter(e=>e.active).map(e=>(
+                  <div key={e.id} className="breakdown-row"><span className="breakdown-label">{e.name}</span><span className="breakdown-val red">−{cur(e.amount)}</span></div>
+                ))}
+                <div className="breakdown-total">
+                  <span className="breakdown-total-label">Net Profit This Month</span>
+                  <span className={`breakdown-total-val ${mNetFull>=0?"green":"red"}`}>{cur(mNetFull)}</span>
+                </div>
+              </div>
+
+              {/* Fixed monthly expenses summary */}
+              <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"#888",marginBottom:10}}>Monthly Fixed Expenses</div>
+              <div className="breakdown-card" style={{marginBottom:16}}>
+                {(settings.expenses||[]).filter(e=>e.active).map(e=>(
+                  <div key={e.id} className="breakdown-row">
+                    <span className="breakdown-label">{e.name}</span>
+                    <div style={{textAlign:"right"}}>
+                      <div className="breakdown-val">{cur(e.amount)}<span style={{fontSize:10,color:"#aaa",fontWeight:400}}>/mo</span></div>
+                      <div style={{fontSize:10,color:"#aaa",fontFamily:"'IBM Plex Mono',monospace"}}>{cur(e.amount/DAYS_IN_MONTH)}/day</div>
+                    </div>
+                  </div>
+                ))}
+                <div className="breakdown-total">
+                  <span className="breakdown-total-label">Total Fixed Expenses</span>
+                  <span className="breakdown-total-val">{cur(monthlyExpTotal)}/mo</span>
+                </div>
+              </div>
+
+              {/* Revenue needed to break even */}
+              <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"#888",marginBottom:10}}>Break-Even Analysis</div>
+              <div className="breakdown-card" style={{marginBottom:16}}>
+                <div className="breakdown-row"><span className="breakdown-label">Fixed expenses / month</span><span className="breakdown-val">{cur(monthlyExpTotal)}</span></div>
+                <div className="breakdown-row"><span className="breakdown-label">Fixed expenses / day</span><span className="breakdown-val">{cur(monthlyExpTotal/DAYS_IN_MONTH)}</span></div>
+                <div className="breakdown-row"><span className="breakdown-label">Fixed expenses / week</span><span className="breakdown-val">{cur(monthlyExpTotal*7/DAYS_IN_MONTH)}</span></div>
+                <div className="breakdown-row">
+                  <span className="breakdown-label">Jobs needed/month to break even</span>
+                  <span className="breakdown-val">{entries.length>0?Math.ceil(monthlyExpTotal/avgRev):"—"} jobs</span>
+                </div>
+                <div className="breakdown-row">
+                  <span className="breakdown-label">This month revenue vs expenses</span>
+                  <span className={`breakdown-val ${mRev>=monthlyExpTotal?"green":"red"}`}>{mRev>=monthlyExpTotal?"✓ Covered":"Short "+cur(monthlyExpTotal-mRev)}</span>
+                </div>
+              </div>
+
+              <div style={{fontSize:11,color:"#aaa",textAlign:"center",marginTop:8}}>
+                Edit expenses in Settings → Monthly Fixed Expenses
+              </div>
+            </div>
+          )}
+
+          {/* ── EMPLOYEES TAB ── */}
+          {dashTab==="employees" && (()=>{
+            const allocMap = buildDailyAllocMap(entries, settings);
+            const emp1Active = settings.emp1Type !== "None";
+            const emp2Active = settings.emp2Type !== "None";
+            if(!emp1Active && !emp2Active){
+              return <div className="empty"><div className="empty-icon">👷</div><div className="empty-text">No employees set up yet</div><div style={{fontSize:13,color:"#aaa",marginTop:6}}>Go to Settings → Employee Pay Structure</div></div>;
+            }
+            // Group by date for day totals
+            const byDate = {};
+            entries.forEach(e=>{
+              if(!byDate[e.date]) byDate[e.date]={date:e.date,jobs:[],emp1Total:0,emp2Total:0};
+              const e1 = e.emp1Pay>0?e.emp1Pay:calcEmpPay(settings.emp1Type,settings.emp1Rate,e.revenue,e.minutes,e.cost);
+              const e2 = e.emp2Pay>0?e.emp2Pay:calcEmpPay(settings.emp2Type,settings.emp2Rate,e.revenue,e.minutes,e.cost);
+              byDate[e.date].jobs.push({...e, _e1:e1, _e2:e2});
+              byDate[e.date].emp1Total += e1;
+              byDate[e.date].emp2Total += e2;
+            });
+            const days = Object.values(byDate).sort((a,b)=>b.date.localeCompare(a.date));
+            const grandE1 = days.reduce((s,d)=>s+d.emp1Total,0);
+            const grandE2 = days.reduce((s,d)=>s+d.emp2Total,0);
+
+            return (
+              <div style={{padding:"14px 14px 20px"}}>
+                {/* All-time summary */}
+                <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"#888",marginBottom:10}}>All-Time Employee Pay</div>
+                <div className="breakdown-card" style={{marginBottom:16}}>
+                  {emp1Active&&<div className="breakdown-row"><span className="breakdown-label" style={{fontWeight:600}}>{settings.emp1Name}</span><span className="breakdown-val">{cur(grandE1)}</span></div>}
+                  {emp2Active&&<div className="breakdown-row"><span className="breakdown-label" style={{fontWeight:600}}>{settings.emp2Name}</span><span className="breakdown-val">{cur(grandE2)}</span></div>}
+                  <div className="breakdown-total"><span className="breakdown-total-label">Total Paid Out</span><span className="breakdown-total-val">{cur(grandE1+grandE2)}</span></div>
+                </div>
+
+                {/* Day by day */}
+                <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"#888",marginBottom:10}}>Pay by Day</div>
+                {days.map(day=>(
+                  <div key={day.date} className="breakdown-card" style={{marginBottom:12}}>
+                    {/* Day header */}
+                    <div style={{padding:"9px 14px",background:"#f9f9f9",borderBottom:"1px solid #e0e0e0",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span style={{fontSize:12,fontWeight:700,color:"#111"}}>{day.date}</span>
+                      <span style={{fontSize:11,color:"#888"}}>{day.jobs.length} job{day.jobs.length>1?"s":""}</span>
+                    </div>
+                    {/* Each job */}
+                    {day.jobs.map((job,i)=>(
+                      <div key={job.id} style={{padding:"8px 14px",borderBottom:"1px solid #f5f5f5",background:"#fff"}}>
+                        <div style={{fontSize:12,fontWeight:600,color:"#444",marginBottom:4}}>{job.service.replace("Mobile ","")} {job.tireSize?"· "+job.tireSize:""}</div>
+                        <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
+                          <span style={{fontSize:11,color:"#aaa"}}>Rev: {cur(job.revenue)}</span>
+                          {emp1Active&&job._e1>0&&<span style={{fontSize:11,color:"#555"}}>{settings.emp1Name}: <strong>{cur(job._e1)}</strong></span>}
+                          {emp2Active&&job._e2>0&&<span style={{fontSize:11,color:"#555"}}>{settings.emp2Name}: <strong>{cur(job._e2)}</strong></span>}
+                        </div>
+                      </div>
+                    ))}
+                    {/* Day total */}
+                    <div style={{padding:"9px 14px",background:"#111",display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+                      {emp1Active&&<span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:12,color:"#fff"}}>{settings.emp1Name}: <strong>{cur(day.emp1Total)}</strong></span>}
+                      {emp2Active&&<span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:12,color:"#fff"}}>{settings.emp2Name}: <strong>{cur(day.emp2Total)}</strong></span>}
+                      <span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:12,color:"#aaa"}}>Total: {cur(day.emp1Total+day.emp2Total)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+
+          {/* ── FIXED COSTS TAB ── */}
+          {dashTab==="expenses" && (()=>{
+            const allocMap = buildDailyAllocMap(entries, settings);
+            const totalDailyOH = dailyOverhead(settings);
+            // Group by date
+            const byDate = {};
+            entries.forEach(e=>{
+              if(!byDate[e.date]) byDate[e.date]={date:e.date,jobs:[],overhead:totalDailyOH};
+              byDate[e.date].jobs.push({...e, _overhead: allocMap[e.date]||0});
+            });
+            const days = Object.values(byDate).sort((a,b)=>b.date.localeCompare(a.date));
+            const activeDays = days.length;
+            const totalOHCharged = activeDays * totalDailyOH;
+
+            return (
+              <div style={{padding:"14px 14px 20px"}}>
+
+                {/* Monthly expenses summary */}
+                <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"#888",marginBottom:10}}>Monthly Fixed Costs</div>
+                <div className="breakdown-card" style={{marginBottom:16}}>
+                  {(settings.expenses||[]).filter(e=>e.active).map(e=>(
+                    <div key={e.id} className="breakdown-row">
+                      <span className="breakdown-label" style={{fontWeight:600}}>{e.name}</span>
+                      <div style={{textAlign:"right"}}>
+                        <div className="breakdown-val">{cur(e.amount)}<span style={{fontSize:10,color:"#aaa",fontWeight:400}}>/mo</span></div>
+                        <div style={{fontSize:10,color:"#aaa",fontFamily:"'IBM Plex Mono',monospace"}}>{cur(e.amount/DAYS_IN_MONTH)}/day</div>
+                      </div>
+                    </div>
+                  ))}
+                  <div className="breakdown-total">
+                    <span className="breakdown-total-label">Total</span>
+                    <span className="breakdown-total-val">{cur(calcMonthlyExpenses(settings.expenses))}/mo · {cur(totalDailyOH)}/day</span>
+                  </div>
+                </div>
+
+                {/* Break-even */}
+                <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"#888",marginBottom:10}}>Break-Even</div>
+                <div className="breakdown-card" style={{marginBottom:16}}>
+                  <div className="breakdown-row"><span className="breakdown-label">Daily overhead</span><span className="breakdown-val">{cur(totalDailyOH)}</span></div>
+                  <div className="breakdown-row"><span className="breakdown-label">Weekly overhead</span><span className="breakdown-val">{cur(totalDailyOH*7)}</span></div>
+                  <div className="breakdown-row"><span className="breakdown-label">Monthly overhead</span><span className="breakdown-val">{cur(calcMonthlyExpenses(settings.expenses))}</span></div>
+                  <div className="breakdown-row"><span className="breakdown-label">Jobs to cover/month</span><span className="breakdown-val">{entries.length>0?Math.ceil(calcMonthlyExpenses(settings.expenses)/(entries.reduce((s,e)=>s+e.revenue,0)/entries.length||1)):"—"} jobs</span></div>
+                  <div className="breakdown-row">
+                    <span className="breakdown-label">This month revenue vs overhead</span>
+                    <span className={`breakdown-val ${mRev>=calcMonthlyExpenses(settings.expenses)?"green":"red"}`}>{mRev>=calcMonthlyExpenses(settings.expenses)?"✓ Covered":"Short "+cur(calcMonthlyExpenses(settings.expenses)-mRev)}</span>
+                  </div>
+                </div>
+
+                {/* Day by day overhead */}
+                <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"#888",marginBottom:10}}>Overhead by Day</div>
+                {days.map(day=>(
+                  <div key={day.date} className="breakdown-card" style={{marginBottom:12}}>
+                    <div style={{padding:"9px 14px",background:"#f9f9f9",borderBottom:"1px solid #e0e0e0",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span style={{fontSize:12,fontWeight:700,color:"#111"}}>{day.date}</span>
+                      <span style={{fontSize:11,color:"#888"}}>{day.jobs.length} job{day.jobs.length>1?"s":""} · {cur(totalDailyOH)}/day overhead</span>
+                    </div>
+                    {day.jobs.map(job=>(
+                      <div key={job.id} style={{padding:"8px 14px",borderBottom:"1px solid #f5f5f5",background:"#fff",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div>
+                          <div style={{fontSize:12,fontWeight:600,color:"#444"}}>{job.service.replace("Mobile ","")}{job.tireSize?" · "+job.tireSize:""}</div>
+                          <div style={{fontSize:11,color:"#aaa",marginTop:2}}>Rev: {cur(job.revenue)}</div>
+                        </div>
+                        <div style={{textAlign:"right"}}>
+                          <div style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:12,fontWeight:600,color:"#ef4444"}}>−{cur(job._overhead)}</div>
+                          <div style={{fontSize:10,color:"#aaa"}}>overhead share</div>
+                        </div>
+                      </div>
+                    ))}
+                    <div style={{padding:"9px 14px",background:"#111",display:"flex",justifyContent:"space-between"}}>
+                      <span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:12,color:"#aaa"}}>Day overhead charged</span>
+                      <span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:12,color:"#fff",fontWeight:700}}>−{cur(totalDailyOH)}</span>
+                    </div>
+                  </div>
+                ))}
+
+                <div style={{fontSize:11,color:"#aaa",textAlign:"center",marginTop:8}}>
+                  Edit expenses in Settings → Monthly Fixed Expenses
+                </div>
+              </div>
+            );
+          })()}
 
           {dashTab==="weekly" && (
             <>
@@ -559,8 +767,8 @@ function AddScreen({form, setForm, onSave, onSaveAndAdd, error, setError, succes
   const setF=useCallback((k,v)=>setForm(p=>({...p,[k]:v})),[setForm]);
   const pRev=form.revenue?parseFloat(form.revenue):0, pCost=form.cost?parseFloat(form.cost):0;
   const pMins=form.minutes?parseInt(form.minutes):0;
-  const autoEmp1=calcEmpPay(settings.emp1Type,settings.emp1Rate,pRev,pMins);
-  const autoEmp2=calcEmpPay(settings.emp2Type,settings.emp2Rate,pRev,pMins);
+  const autoEmp1=calcEmpPay(settings.emp1Type,settings.emp1Rate,pRev,pMins,pCost);
+  const autoEmp2=calcEmpPay(settings.emp2Type,settings.emp2Rate,pRev,pMins,pCost);
   const emp1Pay=form.emp1Pay?parseFloat(form.emp1Pay):autoEmp1;
   const emp2Pay=form.emp2Pay?parseFloat(form.emp2Pay):autoEmp2;
   const grossProfit=pRev-pCost;
@@ -652,7 +860,7 @@ function AddScreen({form, setForm, onSave, onSaveAndAdd, error, setError, succes
 // ── HISTORY SCREEN ──
 function HistoryScreen({entries, onDelete, filterSvc, setFilterSvc, filterStatus, setFilterStatus, settings}){
   const filtered=entries.filter(e=>(filterSvc==="All"||e.service===filterSvc)&&(filterStatus==="All"||e.status===filterStatus));
-  const fRev=filtered.reduce((s,e)=>s+e.revenue,0), fNet=filtered.reduce((s,e)=>s+jobNet(e,settings),0);
+  const fRev=filtered.reduce((s,e)=>s+e.revenue,0); const hAllocMap=buildDailyAllocMap(filtered,settings); const fNet=filtered.reduce((s,e)=>s+jobNet(e,settings,hAllocMap),0);
   return (
     <div className="screen">
       <div className="hist-header">
@@ -663,9 +871,9 @@ function HistoryScreen({entries, onDelete, filterSvc, setFilterSvc, filterStatus
         <>
           <div className="hist-sum">{filtered.length} jobs · {cur(fRev)} rev · {cur(fNet)} net</div>
           {filtered.map(e=>{
-            const ep=totalEmpPay(e,settings), net=jobNet(e,settings);
-            const e1=e.emp1Pay>0?e.emp1Pay:calcEmpPay(settings.emp1Type,settings.emp1Rate,e.revenue,e.minutes);
-            const e2=e.emp2Pay>0?e.emp2Pay:calcEmpPay(settings.emp2Type,settings.emp2Rate,e.revenue,e.minutes);
+            const ep=totalEmpPay(e,settings), net=jobNet(e,settings,hAllocMap);
+            const e1=e.emp1Pay>0?e.emp1Pay:calcEmpPay(settings.emp1Type,settings.emp1Rate,e.revenue,e.minutes,e.cost);
+            const e2=e.emp2Pay>0?e.emp2Pay:calcEmpPay(settings.emp2Type,settings.emp2Rate,e.revenue,e.minutes,e.cost);
             return (
               <div key={e.id} className="hist-card">
                 <div style={{fontSize:20,flexShrink:0,paddingTop:1}}>{ICONS[e.service]||"⚙️"}</div>
@@ -680,6 +888,7 @@ function HistoryScreen({entries, onDelete, filterSvc, setFilterSvc, filterStatus
                   <div className="hcard-rev">{cur(e.revenue)}</div>
                   <div className="hcard-net" style={{color:net>=0?"#555":"#ef4444"}}>net {cur(net)}</div>
                   {ep>0&&<div className="hcard-detail">emp {cur(ep)}</div>}
+                  {(hAllocMap[e.date]||0)>0&&<div className="hcard-detail">ovhd {cur(hAllocMap[e.date])}</div>}
                 </div>
                 <button className="del-btn btn" onClick={()=>onDelete(e.id)}>×</button>
               </div>
@@ -779,7 +988,7 @@ function SettingsScreen({entries, setEntries, settings, setSettings, syncStatus,
                   {empType==="Per Job (flat)"&&<span style={{fontSize:13,color:"#888"}}>/job</span>}
                 </div>
                 <div style={{fontSize:11,color:"#aaa",marginTop:6}}>
-                  Total paid so far: {cur(entries.reduce((s,e)=>s+calcEmpPay(empType,settings[rateKey],e.revenue,e.minutes),0))}
+                  Total paid so far: {cur(entries.reduce((s,e)=>s+calcEmpPay(empType,settings[rateKey],e.revenue,e.minutes,e.cost),0))}
                 </div>
               </div>
             )}
