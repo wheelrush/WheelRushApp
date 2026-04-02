@@ -446,11 +446,22 @@ return (
 // ── Setup Screen ──
 function SetupScreen({onComplete, onSkip}){
 const [error,setError]=useState(””);
-const connect=()=>{
-const cfg={apiKey:“AIzaSyBOwfEmeSCbhCSQB2HYorkWTUbL4es_ntY”,authDomain:“wheel-rush-expense.firebaseapp.com”,projectId:“wheel-rush-expense”,storageBucket:“wheel-rush-expense.firebasestorage.app”,messagingSenderId:“400580006654”,appId:“1:400580006654:web:b8e435c2807b51af244baf”,measurementId:“G-35BBYPHMJ8”};
+const [connecting,setConnecting]=useState(false);
+const connect=async()=>{
+setConnecting(true); setError(””);
+const cfg={apiKey:“AIzaSyA7q8zr9Ilygu-2Weds8VO2Z9xy9”,authDomain:“wheel-rush-expense.firebaseapp.com”,projectId:“wheel-rush-expense”,storageBucket:“wheel-rush-expense.firebasestorage.app”,messagingSenderId:“400580006654”,appId:“1:400580006654:web:b8e435c2807b51af244baf”,measurementId:“G-35BBYPHMJ8”};
 const ok=initFirebase(cfg);
-if(ok){saveFBConfig(cfg);onComplete(cfg);}
-else setError(“Could not connect. Check your internet and try again.”);
+if(ok){
+try{
+await _db.collection(“wheelrush_jobs”).limit(1).get();
+saveFBConfig(cfg); onComplete(cfg);
+}catch(e){
+setError(“Firebase connected but database access failed. Go to console.firebase.google.com → Firestore Database → Rules → make sure it says: allow read, write: if true → click Publish.”);
+}
+} else {
+setError(“Could not connect. Check your internet and try again.”);
+}
+setConnecting(false);
 };
 return (
 <div style={{height:“100%”,overflow:“auto”,background:”#fff”}}>
@@ -460,7 +471,7 @@ return (
 <div className="setup-sub">Sync jobs instantly across all your devices.</div>
 <div className="setup-card"><div className="setup-card-title">✅ Ready to connect</div><div className="setup-card-sub">Your Wheel Rush Firebase database is set up. Tap Connect to sync this device.</div></div>
 {error&&<div className="error-box">{error}</div>}
-<button className="setup-btn btn" onClick={connect}>🔗 Connect & Enable Sync</button>
+<button className="setup-btn btn" onClick={connect} disabled={connecting}>{connecting?“Connecting…”:“🔗 Connect & Enable Sync”}</button>
 <button className="setup-skip btn" onClick={onSkip}>Skip — use offline only</button>
 </div>
 </div>
@@ -1373,7 +1384,12 @@ return (
         <div className="settings-row-title" style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:8,height:8,borderRadius:"50%",background:syncColor,boxShadow:syncStatus==="connected"?`0 0 6px ${syncColor}`:""}}/>{fbEnabled?"Firebase Connected":"Not Connected"}</div>
         <div className="settings-row-sub">{{"connected":"Syncing across all devices","syncing":"Syncing...","offline":"Offline","error":"Connection error"}[syncStatus]||"Set up below"}</div>
       </div>
-      {!fbEnabled?<button className="settings-btn green btn" onClick={onSetupSync}>Set Up</button>:<button className="settings-btn danger btn" onClick={onDisconnectSync}>Disconnect</button>}
+      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+        {!fbEnabled
+          ?<button className="settings-btn green btn" onClick={onSetupSync}>Set Up</button>
+          :<><button className="settings-btn outline btn" onClick={onSetupSync} style={{fontSize:11}}>Reconnect</button><button className="settings-btn danger btn" onClick={onDisconnectSync}>Disconnect</button></>
+        }
+      </div>
     </div>
   </div>
 
@@ -1605,26 +1621,57 @@ const tireUnsubRef = useRef(null);
 const tireSavingRef = useRef(false);
 const jobSavingRef = useRef(false);
 
+const retryRef = useRef(null);
+
 const startListening=useCallback(()=>{
 setSyncStatus(“syncing”);
 if(unsubRef.current) unsubRef.current();
+if(retryRef.current) clearTimeout(retryRef.current);
+
+```
 const unsub=fbListen(docs=>{
-if(jobSavingRef.current) return; // block listener while saving/deleting
-setEntries(docs);saveLocal(docs);setLoaded(true);setSyncStatus(“connected”);
+  if(jobSavingRef.current) return;
+  setEntries(docs); saveLocal(docs); setLoaded(true); setSyncStatus("connected");
 });
 unsubRef.current=unsub;
-// Also listen to tire inventory
+
+// Tire inventory listener
 if(tireUnsubRef.current) tireUnsubRef.current();
 const tireUnsub=fbListenTires(docs=>{
-if(tireSavingRef.current) return;
-if(docs.length>0){ const sorted=docs.sort((a,b)=>a.rim-b.rim||a.size.localeCompare(b.size)); setTires(sorted); saveTiresLocal(sorted); }
-else{ const local=loadTiresLocal(); const data=local||INITIAL_TIRES; setTires(data); fbSaveAllTires(data); }
+  if(tireSavingRef.current) return;
+  if(docs.length>0){ const sorted=docs.sort((a,b)=>a.rim-b.rim||a.size.localeCompare(b.size)); setTires(sorted); saveTiresLocal(sorted); }
+  else{ const local=loadTiresLocal(); const data=local||INITIAL_TIRES; setTires(data); fbSaveAllTires(data); }
 });
 tireUnsubRef.current=tireUnsub;
+
+// Health check — ping Firestore every 45s to detect dropped connections
+const healthCheck = setInterval(async()=>{
+  if(!_db) return;
+  try{
+    await _db.collection("wheelrush_jobs").limit(1).get();
+    setSyncStatus("connected");
+  }catch(e){
+    console.warn("Health check failed, reconnecting...", e);
+    setSyncStatus("syncing");
+    clearInterval(healthCheck);
+    retryRef.current = setTimeout(()=>startListening(), 3000);
+  }
+}, 45000);
+return ()=>clearInterval(healthCheck);
+```
+
 },[]);
 
 const handleFBSetup=useCallback(()=>{setFbEnabled(true);setShowSetup(false);startListening();},[startListening]);
-const handleDisconnect=useCallback(()=>{ if(!window.confirm(“Disconnect Firebase?”)) return; if(unsubRef.current) unsubRef.current(); localStorage.removeItem(FB_CONFIG_KEY); setFbEnabled(false);setSyncStatus(“offline”); try{if(firebase.apps.length>0)firebase.apps[0].delete();}catch{} _db=null; },[]);
+const handleDisconnect=useCallback(()=>{
+if(!window.confirm(“Disconnect sync? Your data stays on this device.”)) return;
+if(unsubRef.current) unsubRef.current();
+if(tireUnsubRef.current) tireUnsubRef.current();
+if(retryRef.current) clearTimeout(retryRef.current);
+localStorage.removeItem(FB_CONFIG_KEY);
+setFbEnabled(false); setSyncStatus(“offline”);
+try{ if(firebase.apps.length>0) firebase.apps[0].delete(); }catch{} _db=null;
+},[]);
 
 const saveEntryFB=useCallback(async entry=>{
 try{
