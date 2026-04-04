@@ -2068,7 +2068,15 @@ if(fbEnabled){ try{ jSavingRef.current=true; await fbSaveJob(entry); setSyncStat
 const updateJob = useCallback(async(updated)=>{
 const next=jobs.map(e=>e.id===updated.id?updated:e);
 setJobs(next); saveJobs(next);
-if(fbEnabled){ try{ jSavingRef.current=true; await fbSaveJob(updated); setSyncStatus(“connected”); }catch{setSyncStatus(“error”);}finally{setTimeout(()=>jSavingRef.current=false,800);} }
+if(fbEnabled){
+jSavingRef.current=true;
+try{
+setSyncStatus(“syncing”);
+await fbSaveJob(updated);
+setSyncStatus(“connected”);
+}catch(e){ setSyncStatus(“error”); }
+finally{ setTimeout(()=>{ jSavingRef.current=false; },1500); }
+}
 },[jobs,fbEnabled]);
 
 const deleteJob = useCallback(async(id)=>{
