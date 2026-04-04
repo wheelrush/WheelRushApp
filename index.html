@@ -298,7 +298,20 @@ const DEFAULT_SETTINGS = {
   profitSplit2: 50,
   costPerMile:  0.65,
 };
-const loadSettings = () => { try{ const v=localStorage.getItem(SETTINGS_KEY); return v?{...DEFAULT_SETTINGS,...JSON.parse(v)}:DEFAULT_SETTINGS; }catch{return DEFAULT_SETTINGS;} };
+const loadSettings = () => {
+  try{
+    const v=localStorage.getItem(SETTINGS_KEY);
+    if(!v) return DEFAULT_SETTINGS;
+    const saved = JSON.parse(v);
+    // Merge expenses: keep saved ones, add any new defaults not yet in saved
+    const savedIds = new Set((saved.expenses||[]).map(e=>e.id));
+    const mergedExpenses = [
+      ...(saved.expenses||[]),
+      ...DEFAULT_SETTINGS.expenses.filter(e=>!savedIds.has(e.id))
+    ];
+    return {...DEFAULT_SETTINGS, ...saved, expenses: mergedExpenses};
+  }catch{return DEFAULT_SETTINGS;}
+};
 const saveSettings = s => { try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(s));}catch{} };
 const loadJobs     = () => { try{ const v=localStorage.getItem(LOCAL_JOBS_KEY); return v?JSON.parse(v):[]; }catch{return [];} };
 const saveJobs     = d => { try{localStorage.setItem(LOCAL_JOBS_KEY,JSON.stringify(d));}catch{} };
