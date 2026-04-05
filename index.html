@@ -335,7 +335,7 @@ let _db=null, _auth=null, _uid=null, _jobUnsub=null, _tireUnsub=null;
 const jSavingRef={current:false}, tSavingRef={current:false};
 
 // ── Firebase init — called ONCE at startup ──
-const FB_CFG={apiKey:"AIzaSyA7q8zr9Ilygu-2Weds8VO2Z9xy9dK51HE",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
+const FB_CFG={apiKey:"AIzaSyBOwfEmeSCbhCSQB2HYorkWTUbL4es_ntY",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
 
 function initFB(cfg){
   try{
@@ -2202,7 +2202,7 @@ function SetupScreen({onComplete, onSkip}){
   const [loading,setLoading] = useState(false);
   const connect = async() => {
     setLoading(true); setError("");
-    const cfg={apiKey:"AIzaSyA7q8zr9Ilygu-2Weds8VO2Z9xy9dK51HE",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
+    const cfg={apiKey:"AIzaSyBOwfEmeSCbhCSQB2HYorkWTUbL4es_ntY",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
     const ok=initFB(cfg);
     if(ok){
       try{
