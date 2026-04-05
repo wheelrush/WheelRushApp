@@ -14,6 +14,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
@@ -297,6 +298,10 @@ const DEFAULT_SETTINGS = {
   profitSplit1: 50,
   profitSplit2: 50,
   costPerMile:  0.65,
+  zelleInfo:    "(305) 897-7030",
+  bizPhone:     "(305) 897-7030",
+  bizAddress:   "Miami, FL",
+  bizEmail:     "contact@wheelrush.net",
 };
 const loadSettings = () => {
   try{
@@ -326,21 +331,28 @@ const loadFBCfg    = () => { try{ const v=localStorage.getItem("wr-firebase-cfg"
 const saveFBCfg    = c => { try{localStorage.setItem("wr-firebase-cfg",JSON.stringify(c));}catch{} };
 
 // ── Firebase ──
-let _db=null, _jobUnsub=null, _tireUnsub=null;
+let _db=null, _auth=null, _uid=null, _jobUnsub=null, _tireUnsub=null;
 const jSavingRef={current:false}, tSavingRef={current:false};
 
+// ── Firebase init ──
 function initFB(cfg){
   try{
     if(firebase.apps.length>0) firebase.apps[0].delete();
     const app=firebase.initializeApp(cfg);
     _db=firebase.firestore(app);
+    _auth=firebase.auth(app);
     _db.enablePersistence({synchronizeTabs:true}).catch(()=>{});
     return true;
   }catch(e){return false;}
 }
-const fbJobCol  = () => _db?_db.collection("wheelrush_jobs"):null;
-const fbTireCol = () => _db?_db.collection("tire_inventory"):null;
-const fbSaleCol = () => _db?_db.collection("tire_sales"):null;
+
+// ── User-scoped collection helpers ──
+const userCol = (name) => (_db&&_uid) ? _db.collection("users").doc(_uid).collection(name) : null;
+const fbJobCol  = () => userCol("jobs");
+const fbTireCol = () => userCol("tires");
+const fbSaleCol = () => userCol("sales");
+function fbReceiptCol(){ return userCol("receipts"); }
+
 async function fbSaveJob(e){ const c=fbJobCol(); if(!c) return; await c.doc(String(e.id)).set(e); }
 async function fbDelJob(id){ const c=fbJobCol(); if(!c) return; await c.doc(String(id)).delete(); }
 function fbListenJobs(cb){ const c=fbJobCol(); if(!c) return ()=>{}; return c.orderBy("id","desc").onSnapshot(s=>{if(!jSavingRef.current)cb(s.docs.map(d=>d.data()));},()=>{}); }
@@ -349,9 +361,15 @@ async function fbDelTire(id){ const c=fbTireCol(); if(!c) return; await c.doc(St
 async function fbSaveAllTires(ts){ const c=fbTireCol(); if(!c) return; const b=_db.batch(); const s=await c.get(); s.docs.forEach(d=>b.delete(d.ref)); ts.forEach(t=>b.set(c.doc(String(t.id)),t)); await b.commit(); }
 function fbListenTires(cb){ const c=fbTireCol(); if(!c) return ()=>{}; return c.onSnapshot(s=>{if(!tSavingRef.current)cb(s.docs.map(d=>d.data()));},()=>{}); }
 async function fbLogSale(sale){ const c=fbSaleCol(); if(!c) return; await c.doc(String(sale.id)).set(sale); }
-function fbReceiptCol(){ return _db?_db.collection("wr_receipts"):null; }
 async function fbSaveReceipt(r){ const c=fbReceiptCol(); if(!c) return; await c.doc(String(r.id)).set(r); }
 async function fbDelReceipt(id){ const c=fbReceiptCol(); if(!c) return; await c.doc(String(id)).delete(); }
+
+// ── Auth helpers ──
+const signUp   = (email,pw) => _auth.createUserWithEmailAndPassword(email,pw);
+const signIn   = (email,pw) => _auth.signInWithEmailAndPassword(email,pw);
+const resetPw  = (email)    => _auth.sendPasswordResetEmail(email);
+const signOut  = ()         => _auth.signOut();
+const onAuthChange = (cb)   => _auth ? _auth.onAuthStateChanged(cb) : ()=>{};
 
 // ════════════════════════════════════════════
 // ── FINANCE ENGINE (co-owner, accrued model) ──
@@ -776,10 +794,11 @@ function DashboardScreen({jobs, settings, setTab}){
 // ── ADD JOB SCREEN ──
 // ────────────────────────────────────────────────
 function AddJobScreen({onSave, onSaveAdd, settings}){
-  const [form,setForm] = useState(()=>EMPTY_JOB());
-  const [error,setError] = useState("");
-  const [saved,setSaved] = useState(false);
+  const [form,setForm]       = useState(()=>EMPTY_JOB());
+  const [error,setError]     = useState("");
+  const [saved,setSaved]     = useState(false);
   const [expectedJobs,setExpectedJobs] = useState(4);
+  const [invoiceJob,setInvoiceJob]     = useState(null); // show invoice after save
   const setF = useCallback((k,v)=>setForm(p=>({...p,[k]:v})),[]);
   const toggleF = useCallback((k)=>setForm(p=>({...p,[k]:!p[k]})),[]);
 
@@ -808,11 +827,16 @@ function AddJobScreen({onSave, onSaveAdd, settings}){
       revenue:rev, cost, miles, tireSize:form.tireSize.trim(),
       qty:parseInt(form.qty)||1, note:form.note.trim(),
       emergency:form.emergency, lateNight:form.lateNight, highway:form.highway, weekend:form.weekend,
-      // backward compat
       mileage:miles
     };
-    if(andAdd){onSaveAdd(entry);setForm(EMPTY_JOB());setSaved(true);setTimeout(()=>setSaved(false),2000);}
-    else{onSave(entry);}
+    if(andAdd){
+      onSaveAdd(entry); setForm(EMPTY_JOB());
+      setSaved(true); setTimeout(()=>setSaved(false),2000);
+    } else {
+      onSave(entry);
+      setInvoiceJob(entry); // show invoice
+      setForm(EMPTY_JOB());
+    }
     setError("");
   };
 
@@ -824,6 +848,7 @@ function AddJobScreen({onSave, onSaveAdd, settings}){
 
   return (
     <div className="screen">
+      {invoiceJob&&<InvoiceModal job={invoiceJob} settings={settings} onClose={()=>setInvoiceJob(null)}/>}
       <div className="form-page">
         <div className="form-title">Log New Job</div>
         {error&&<div className="error-box">{error}</div>}
@@ -903,12 +928,189 @@ function AddJobScreen({onSave, onSaveAdd, settings}){
   );
 }
 
+
+// ────────────────────────────────────────────────
+// ── INVOICE MODAL ──
+// ────────────────────────────────────────────────
+function InvoiceModal({job, settings, onClose}){
+  if(!job) return null;
+
+  const invoiceNum  = "WR-" + String(job.id).slice(-6).toUpperCase();
+  const miles       = Number(job.miles||job.mileage||0);
+  const cpm         = Number(settings.costPerMile||0.65);
+  const travel      = miles * cpm;
+  const totalCost   = Number(job.cost||0) + travel;
+  const dueDate     = new Date(job.date+"T00:00:00");
+  dueDate.setDate(dueDate.getDate()+7);
+  const dueDateStr  = dueDate.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});
+  const isPending   = job.status==="Pending Payment";
+
+  // Zelle info
+  const zelleInfo = settings.zelleInfo||"";
+
+  // Share invoice as text
+  const shareInvoice = () => {
+    const lines = [
+      "🛞 WHEEL RUSH MOBILE TIRE REPAIR",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━",
+      `Invoice #${invoiceNum}`,
+      `Date: ${job.date}`,
+      `Due: ${dueDateStr}`,
+      "",
+      job.customerName ? `Bill To: ${job.customerName}` : "",
+      job.customerPhone ? `Phone: ${job.customerPhone}` : "",
+      "",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━",
+      `Service: ${job.service}`,
+      job.tireSize ? `Tire Size: ${job.tireSize}` : "",
+      job.qty>1 ? `Qty: ${job.qty}` : "",
+      `Location: ${job.area}`,
+      miles>0 ? `Miles: ${miles}` : "",
+      "",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━",
+      job.cost>0  ? `Parts/Materials: $${Number(job.cost).toFixed(2)}` : "",
+      travel>0    ? `Travel (${miles}mi): $${travel.toFixed(2)}` : "",
+      `TOTAL DUE: $${Number(job.revenue).toFixed(2)}`,
+      "",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━",
+      zelleInfo ? `Zelle: ${zelleInfo}` : "",
+      settings.bizPhone ? `Call/Text: ${settings.bizPhone}` : "",
+      settings.bizEmail ? `Email: ${settings.bizEmail}` : "",
+      "",
+      "Thank you for your business!",
+    ].filter(Boolean).join("\n");
+
+    if(navigator.share){
+      navigator.share({title:`Invoice ${invoiceNum}`,text:lines}).catch(()=>{});
+    } else {
+      navigator.clipboard.writeText(lines).then(()=>alert("Invoice copied to clipboard!")).catch(()=>alert(lines));
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{padding:"0 0 32px",borderRadius:"18px 18px 0 0",maxHeight:"92vh",overflow:"auto"}}>
+        {/* Header bar */}
+        <div style={{background:"#111",padding:"16px 20px 14px",borderRadius:"18px 18px 0 0",position:"sticky",top:0,zIndex:10}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <div>
+              <div style={{color:"#fff",fontSize:15,fontWeight:700}}>Invoice {invoiceNum}</div>
+              <div style={{color:"#666",fontSize:11,marginTop:2}}>{isPending?"⏳ Payment Pending":"✓ Paid"}</div>
+            </div>
+            <button onClick={onClose} style={{background:"none",border:"none",color:"#666",fontSize:22,cursor:"pointer",lineHeight:1}}>✕</button>
+          </div>
+        </div>
+
+        <div style={{padding:"20px 20px 0"}}>
+          {/* Business header */}
+          <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20}}>
+            <img src={`data:image/png;base64,${LOGO}`} style={{width:44,height:44,borderRadius:10,objectFit:"contain",background:"#f4f4f4"}} alt=""/>
+            <div>
+              <div style={{fontSize:15,fontWeight:700,color:"#111"}}>Wheel Rush Mobile Tire Repair</div>
+              {settings.bizPhone&&<div style={{fontSize:12,color:"#888",marginTop:1}}>📞 {settings.bizPhone}</div>}
+              {settings.bizEmail&&<div style={{fontSize:12,color:"#888",marginTop:1}}>✉️ {settings.bizEmail}</div>}
+              {settings.bizAddress&&<div style={{fontSize:12,color:"#888",marginTop:1}}>📍 {settings.bizAddress}</div>}
+            </div>
+          </div>
+
+          {/* Date / due */}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+            <div style={{background:"#f9f9f9",borderRadius:10,padding:"10px 12px"}}>
+              <div style={{fontSize:10,color:"#aaa",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:3}}>Date</div>
+              <div style={{fontSize:13,fontWeight:700,color:"#111"}}>{job.date}</div>
+            </div>
+            <div style={{background:isPending?"#fff8f8":"#f0fdf4",borderRadius:10,padding:"10px 12px"}}>
+              <div style={{fontSize:10,color:"#aaa",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:3}}>Due Date</div>
+              <div style={{fontSize:13,fontWeight:700,color:isPending?"#dc2626":"#16a34a"}}>{isPending?dueDateStr:"Paid"}</div>
+            </div>
+          </div>
+
+          {/* Bill to */}
+          {(job.customerName||job.customerPhone)&&(
+            <div style={{background:"#f9f9f9",borderRadius:10,padding:"12px 14px",marginBottom:14}}>
+              <div style={{fontSize:10,color:"#aaa",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:6}}>Bill To</div>
+              {job.customerName&&<div style={{fontSize:14,fontWeight:600,color:"#111"}}>{job.customerName}</div>}
+              {job.customerPhone&&<div style={{fontSize:13,color:"#555",marginTop:2}}>📞 {job.customerPhone}</div>}
+            </div>
+          )}
+
+          {/* Service line items */}
+          <div style={{border:"1px solid #f0f0f0",borderRadius:12,overflow:"hidden",marginBottom:14}}>
+            <div style={{padding:"10px 14px",background:"#f9f9f9",borderBottom:"1px solid #f0f0f0",display:"grid",gridTemplateColumns:"1fr auto",gap:8}}>
+              <span style={{fontSize:10,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"#aaa"}}>Description</span>
+              <span style={{fontSize:10,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"#aaa"}}>Amount</span>
+            </div>
+            {/* Main service */}
+            <div style={{padding:"12px 14px",borderBottom:"1px solid #f5f5f5",display:"grid",gridTemplateColumns:"1fr auto",gap:8,alignItems:"start"}}>
+              <div>
+                <div style={{fontSize:13,fontWeight:600,color:"#111"}}>{job.service}</div>
+                {job.tireSize&&<div style={{fontSize:11,color:"#888",marginTop:2}}>{job.tireSize}{job.qty>1?" × "+job.qty:""}</div>}
+                <div style={{fontSize:11,color:"#888",marginTop:1}}>{job.area}{job.emergency?" · Emergency":""}{job.lateNight?" · Late Night":""}{job.highway?" · Highway":""}</div>
+              </div>
+              <div style={{fontFamily:"IBM Plex Mono,monospace",fontSize:14,fontWeight:700,color:"#111",whiteSpace:"nowrap"}}>{cur(job.revenue)}</div>
+            </div>
+            {/* Total row */}
+            <div style={{padding:"12px 14px",background:"#111",display:"grid",gridTemplateColumns:"1fr auto",alignItems:"center"}}>
+              <span style={{fontSize:14,fontWeight:700,color:"#fff"}}>Total Due</span>
+              <span style={{fontFamily:"IBM Plex Mono,monospace",fontSize:18,fontWeight:700,color:"#22c55e"}}>{cur(job.revenue)}</span>
+            </div>
+          </div>
+
+          {/* Payment */}
+          <div style={{marginBottom:16}}>
+            <div style={{fontSize:11,color:"#aaa",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:10,fontWeight:700}}>Payment</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              <span style={{background:"#f4f4f4",borderRadius:8,padding:"6px 12px",fontSize:12,fontWeight:600,color:"#555"}}>{job.payment}</span>
+              {PAYMENT.filter(p=>p!==job.payment&&p!=="Check").map(p=>(
+                <span key={p} style={{background:"#f9f9f9",borderRadius:8,padding:"6px 12px",fontSize:12,color:"#bbb"}}>{p}</span>
+              ))}
+            </div>
+          </div>
+
+          {/* Zelle CTA */}
+          {zelleInfo?(
+            <div style={{background:"#6d1ed4",borderRadius:12,padding:"14px 16px",marginBottom:12}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+                <div style={{background:"#fff",borderRadius:8,width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                  <span style={{fontSize:18,fontWeight:900,color:"#6d1ed4"}}>Z</span>
+                </div>
+                <div>
+                  <div style={{color:"#fff",fontWeight:700,fontSize:14}}>Pay via Zelle</div>
+                  <div style={{color:"#c4b5fd",fontSize:11,marginTop:1}}>Send {cur(job.revenue)} to:</div>
+                </div>
+              </div>
+              <div style={{background:"rgba(255,255,255,0.15)",borderRadius:8,padding:"10px 12px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                <span style={{color:"#fff",fontFamily:"IBM Plex Mono,monospace",fontSize:14,fontWeight:700}}>{zelleInfo}</span>
+                <button onClick={()=>navigator.clipboard&&navigator.clipboard.writeText(zelleInfo).then(()=>alert("Copied!"))} style={{background:"rgba(255,255,255,0.25)",border:"none",color:"#fff",borderRadius:6,padding:"4px 10px",fontSize:11,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer"}}>Copy</button>
+              </div>
+              <div style={{color:"#c4b5fd",fontSize:11,marginTop:8,textAlign:"center"}}>Ask customer to send <strong style={{color:"#fff"}}>{cur(job.revenue)}</strong> via their bank app</div>
+            </div>
+          ):(
+            <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:10,padding:"10px 14px",marginBottom:12,fontSize:12,color:"#92400e"}}>
+              Add your Zelle email/phone in Settings to show payment info
+            </div>
+          )}
+
+          {/* Share / send button */}
+          <button onClick={shareInvoice} style={{width:"100%",background:"#111",color:"#fff",border:"none",borderRadius:12,padding:"14px",fontSize:15,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer",marginBottom:8}}>
+            📤 Share Invoice
+          </button>
+          <button onClick={onClose} style={{width:"100%",background:"#fff",color:"#888",border:"1.5px solid #e0e0e0",borderRadius:12,padding:"12px",fontSize:14,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:600,cursor:"pointer"}}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ────────────────────────────────────────────────
 // ── HISTORY SCREEN ──
 // ────────────────────────────────────────────────
-function JobDetailModal({job, onClose, onDelete, onUpdate}){
+function JobDetailModal({job, onClose, onDelete, onUpdate, settings}){
   if(!job) return null;
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditing]         = useState(false);
+  const [showInvoice, setShowInvoice] = useState(false);
   const [form, setForm] = useState({
     date: job.date, service: job.service, area: job.area, payment: job.payment,
     status: job.status, customerName: job.customerName||"", customerPhone: job.customerPhone||"",
@@ -973,6 +1175,8 @@ function JobDetailModal({job, onClose, onDelete, onUpdate}){
   const miles = entryMiles(job);
   const travel = travelCost(miles, job.costPerMile||0.65);
   const totCost = Number(job.cost||0) + travel;
+
+  if(showInvoice) return <InvoiceModal job={job} settings={settings||{}} onClose={()=>setShowInvoice(false)}/>;
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -1041,6 +1245,7 @@ function JobDetailModal({job, onClose, onDelete, onUpdate}){
           {job.note&&<div style={{marginTop:10,paddingTop:10,borderTop:"1px solid #f0f0f0"}}><div style={{fontSize:10,color:"#bbb",marginBottom:3}}>Notes</div><div style={{fontSize:13,color:"#555",fontStyle:"italic"}}>{job.note}</div></div>}
         </div>
 
+        <button onClick={()=>setShowInvoice(true)} style={{width:"100%",background:"#111",color:"#fff",border:"none",borderRadius:12,padding:"13px",fontSize:14,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer",marginBottom:10}}>🧾 View / Send Invoice</button>
         <button onClick={()=>{if(window.confirm("Delete this job?"))onDelete(job.id);}} style={{width:"100%",background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:10,padding:"13px",fontSize:14,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer"}}>🗑 Delete Job</button>
       </div>
     </div>
@@ -1084,7 +1289,7 @@ function HistoryScreen({jobs, onDelete, onUpdate, settings, receipts}){
 
   return (
     <div className="screen">
-      {selectedJob&&<JobDetailModal job={selectedJob} onClose={()=>setSelectedJob(null)} onDelete={handleDelete} onUpdate={handleUpdate}/>}
+      {selectedJob&&<JobDetailModal job={selectedJob} onClose={()=>setSelectedJob(null)} onDelete={handleDelete} onUpdate={handleUpdate} settings={settings}/>}
 
       {/* Tab switcher */}
       <div style={{display:"flex",background:"#fff",borderBottom:"1px solid #f0f0f0",position:"sticky",top:0,zIndex:10}}>
@@ -1836,14 +2041,48 @@ function SettingsScreen({jobs, setJobs, settings, setSettings, fbEnabled, syncSt
       <div className="page">
         {msg&&<div className="success-box">{msg}</div>}
 
+        {/* Account */}
+        <div className="section-label" style={{marginTop:0}}>👤 Account</div>
+        <div className="settings-card">
+          <div className="settings-row">
+            <div>
+              <div className="settings-label">Signed In</div>
+              <div className="settings-sub">{fbEnabled?"Syncing to cloud":"Offline mode"}</div>
+            </div>
+            <button onClick={async()=>{ if(window.confirm("Sign out of your account?")){ try{await signOut();}catch{} window.location.reload(); }}} style={{background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:8,padding:"8px 16px",fontSize:12,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer"}}>Sign Out</button>
+          </div>
+          <div style={{padding:"8px 16px 10px",fontSize:11,color:"#aaa"}}>Plan: <strong style={{color:"#111"}}>$29/month</strong> · Your data is private and only visible to you.</div>
+        </div>
+
         {/* Cloud Sync */}
-        <div className="section-label" style={{marginTop:0}}>☁️ Cloud Sync</div>
+        <div className="section-label">☁️ Cloud Sync</div>
         <div className="settings-card">
           <div className="settings-row">
             <div><div className="settings-label" style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:8,height:8,borderRadius:"50%",background:syncColor,boxShadow:syncStatus==="connected"?`0 0 6px ${syncColor}`:""}}></div>{fbEnabled?"Firebase Connected":"Not Connected"}</div><div className="settings-sub">{{"connected":"Syncing across all devices","syncing":"Syncing...","offline":"Tap Set Up to connect","error":"Connection error — tap Reconnect"}[syncStatus]}</div></div>
             <div style={{display:"flex",gap:6}}>
               {!fbEnabled?<button className="settings-btn green" onClick={onSetupSync}>Set Up</button>:<><button className="settings-btn outline" onClick={onSetupSync} style={{fontSize:11}}>Reconnect</button><button className="settings-btn danger" onClick={onDisconnect}>Disconnect</button></>}
             </div>
+          </div>
+        </div>
+
+        {/* Business Info */}
+        <div className="section-label">🏢 Business Info</div>
+        <div className="settings-card">
+          <div className="settings-row">
+            <div><div className="settings-label">Zelle Email / Phone</div><div className="settings-sub">Shown on invoices for payment</div></div>
+            <input value={settings.zelleInfo||""} onChange={e=>upd("zelleInfo",e.target.value)} placeholder="email or phone" style={{border:"1.5px solid #e0e0e0",borderRadius:8,padding:"7px 10px",fontSize:13,fontFamily:"IBM Plex Sans,sans-serif",width:130,textAlign:"right"}}/>
+          </div>
+          <div className="settings-row">
+            <div><div className="settings-label">Business Phone</div><div className="settings-sub">Shown on invoice</div></div>
+            <input value={settings.bizPhone||""} onChange={e=>upd("bizPhone",e.target.value)} placeholder="305-000-0000" style={{border:"1.5px solid #e0e0e0",borderRadius:8,padding:"7px 10px",fontSize:13,fontFamily:"IBM Plex Sans,sans-serif",width:130,textAlign:"right"}}/>
+          </div>
+          <div className="settings-row">
+            <div><div className="settings-label">City / Area</div><div className="settings-sub">Shown on invoice</div></div>
+            <input value={settings.bizAddress||""} onChange={e=>upd("bizAddress",e.target.value)} placeholder="Miami, FL" style={{border:"1.5px solid #e0e0e0",borderRadius:8,padding:"7px 10px",fontSize:13,fontFamily:"IBM Plex Sans,sans-serif",width:130,textAlign:"right"}}/>
+          </div>
+          <div className="settings-row">
+            <div><div className="settings-label">Business Email</div><div className="settings-sub">Shown on invoice</div></div>
+            <input value={settings.bizEmail||""} onChange={e=>upd("bizEmail",e.target.value)} placeholder="you@email.com" style={{border:"1.5px solid #e0e0e0",borderRadius:8,padding:"7px 10px",fontSize:13,fontFamily:"IBM Plex Sans,sans-serif",width:160,textAlign:"right"}}/>
           </div>
         </div>
 
@@ -1985,10 +2224,131 @@ function SetupScreen({onComplete, onSkip}){
   );
 }
 
+
+// ────────────────────────────────────────────────
+// ── AUTH SCREEN ──
+// ────────────────────────────────────────────────
+function AuthScreen({onAuth}){
+  const [mode,setMode]       = useState("login"); // login | signup | reset
+  const [email,setEmail]     = useState("");
+  const [password,setPass]   = useState("");
+  const [bizName,setBizName] = useState("");
+  const [loading,setLoading] = useState(false);
+  const [error,setError]     = useState("");
+  const [msg,setMsg]         = useState("");
+
+  // Auto-init Firebase with hardcoded config
+  useEffect(()=>{
+    const cfg={apiKey:"AIzaSyA7q8zr9Ilygu-2Weds8VO2Z9xy9dK51HE",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
+    initFB(cfg);
+  },[]);
+
+  const handleSubmit = async() => {
+    setError(""); setMsg("");
+    if(!email.trim()||(!password&&mode!=="reset")){setError("Fill in all fields.");return;}
+    setLoading(true);
+    try{
+      if(mode==="login"){
+        const cred = await signIn(email.trim(), password);
+        onAuth(cred.user);
+      } else if(mode==="signup"){
+        if(password.length<6){setError("Password must be at least 6 characters.");setLoading(false);return;}
+        const cred = await signUp(email.trim(), password);
+        // Save business name to user's Firestore profile
+        _uid = cred.user.uid;
+        if(bizName.trim()){
+          await _db.collection("users").doc(_uid).set({bizName:bizName.trim(),plan:"trial",createdAt:Date.now()},{merge:true});
+        }
+        onAuth(cred.user);
+      } else if(mode==="reset"){
+        await resetPw(email.trim());
+        setMsg("Password reset email sent! Check your inbox.");
+        setMode("login");
+      }
+    }catch(e){
+      const msgs={
+        "auth/user-not-found":"No account found with that email.",
+        "auth/wrong-password":"Incorrect password.",
+        "auth/email-already-in-use":"An account with this email already exists.",
+        "auth/invalid-email":"Please enter a valid email address.",
+        "auth/too-many-requests":"Too many attempts. Try again later.",
+      };
+      setError(msgs[e.code]||e.message||"Something went wrong.");
+    }
+    setLoading(false);
+  };
+
+  const inputStyle = {width:"100%",border:"1.5px solid #e0e0e0",borderRadius:10,padding:"13px 14px",fontSize:15,fontFamily:"IBM Plex Sans,sans-serif",marginBottom:12,outline:"none",background:"#fff"};
+  const btnStyle   = {width:"100%",background:"#111",color:"#fff",border:"none",borderRadius:12,padding:"15px",fontSize:16,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer",marginBottom:12};
+
+  return (
+    <div style={{minHeight:"100%",background:"#f4f4f4",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px 20px"}}>
+      {/* Logo + brand */}
+      <div style={{textAlign:"center",marginBottom:32}}>
+        <img src={`data:image/png;base64,${LOGO}`} style={{width:80,height:80,borderRadius:18,objectFit:"contain",marginBottom:14,boxShadow:"0 4px 16px rgba(0,0,0,0.12)"}} alt=""/>
+        <div style={{fontSize:26,fontWeight:700,color:"#111",letterSpacing:"-0.5px"}}>Wheel Rush</div>
+        <div style={{fontSize:14,color:"#888",marginTop:4}}>Mobile Tire Repair Tracker</div>
+      </div>
+
+      {/* Card */}
+      <div style={{background:"#fff",borderRadius:18,padding:"28px 24px",width:"100%",maxWidth:400,boxShadow:"0 2px 16px rgba(0,0,0,0.08)"}}>
+        <div style={{fontSize:20,fontWeight:700,color:"#111",marginBottom:6}}>
+          {mode==="login"?"Welcome back":mode==="signup"?"Create account":"Reset password"}
+        </div>
+        <div style={{fontSize:13,color:"#aaa",marginBottom:24}}>
+          {mode==="login"?"Sign in to your business account":mode==="signup"?"Start tracking your profits — $29/month after trial":"Enter your email to reset your password"}
+        </div>
+
+        {error&&<div style={{background:"#fff1f1",border:"1px solid #fca5a5",borderRadius:10,padding:"10px 14px",fontSize:13,color:"#dc2626",marginBottom:16}}>{error}</div>}
+        {msg&&<div style={{background:"#f0fdf4",border:"1px solid #86efac",borderRadius:10,padding:"10px 14px",fontSize:13,color:"#16a34a",marginBottom:16}}>{msg}</div>}
+
+        {mode==="signup"&&(
+          <input style={inputStyle} type="text" placeholder="Business name (e.g. Wheel Rush)" value={bizName} onChange={e=>setBizName(e.target.value)}/>
+        )}
+        <input style={inputStyle} type="email" placeholder="Email address" value={email} onChange={e=>setEmail(e.target.value)} autoCapitalize="none" autoCorrect="off"/>
+        {mode!=="reset"&&(
+          <input style={inputStyle} type="password" placeholder="Password" value={password} onChange={e=>setPass(e.target.value)}/>
+        )}
+
+        <button style={btnStyle} onClick={handleSubmit} disabled={loading}>
+          {loading?"Please wait...":(mode==="login"?"Sign In":mode==="signup"?"Create Account":"Send Reset Email")}
+        </button>
+
+        {/* Switch modes */}
+        <div style={{textAlign:"center",fontSize:13,color:"#888"}}>
+          {mode==="login"&&<>
+            <span>No account? </span>
+            <button onClick={()=>{setMode("signup");setError("");}} style={{background:"none",border:"none",color:"#111",fontWeight:700,cursor:"pointer",fontFamily:"IBM Plex Sans,sans-serif",fontSize:13}}>Sign up free</button>
+            <div style={{marginTop:10}}>
+              <button onClick={()=>{setMode("reset");setError("");}} style={{background:"none",border:"none",color:"#bbb",cursor:"pointer",fontFamily:"IBM Plex Sans,sans-serif",fontSize:12,textDecoration:"underline"}}>Forgot password?</button>
+            </div>
+          </>}
+          {mode==="signup"&&<>
+            <span>Already have an account? </span>
+            <button onClick={()=>{setMode("login");setError("");}} style={{background:"none",border:"none",color:"#111",fontWeight:700,cursor:"pointer",fontFamily:"IBM Plex Sans,sans-serif",fontSize:13}}>Sign in</button>
+          </>}
+          {mode==="reset"&&<>
+            <button onClick={()=>{setMode("login");setError("");}} style={{background:"none",border:"none",color:"#111",fontWeight:700,cursor:"pointer",fontFamily:"IBM Plex Sans,sans-serif",fontSize:13}}>Back to sign in</button>
+          </>}
+        </div>
+      </div>
+
+      {/* Plan note */}
+      {mode==="signup"&&(
+        <div style={{marginTop:20,fontSize:11,color:"#bbb",textAlign:"center",maxWidth:320}}>
+          14-day free trial · then $29/month · cancel anytime<br/>No credit card required to start.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ────────────────────────────────────────────────
 // ── MAIN APP ──
 // ────────────────────────────────────────────────
 function App(){
+  const [user,      setUser]      = useState(null);   // Firebase user
+  const [authReady, setAuthReady] = useState(false);  // auth state resolved
   const [tab,       setTab]       = useState("dashboard");
   const [jobs,      setJobs]      = useState([]);
   const [tires,     setTires]     = useState(INITIAL_TIRES);
@@ -2001,14 +2361,32 @@ function App(){
   const [syncStatus,setSyncStatus]= useState("offline");
   const retryRef = useRef(null);
 
+  // ── Auth state listener ──
   useEffect(()=>{
-    const cfg=loadFBCfg();
-    if(cfg){
-      const ok=initFB(cfg);
-      if(ok){setFbEnabled(true);startListening();}
-      else{loadLocalAll();setLoaded(true);}
-    } else {loadLocalAll();setLoaded(true);}
+    const cfg={apiKey:"AIzaSyA7q8zr9Ilygu-2Weds8VO2Z9xy9dK51HE",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
+    initFB(cfg);
+    const unsub = onAuthChange((u)=>{
+      setUser(u);
+      setAuthReady(true);
+      if(u){
+        _uid=u.uid;
+        setFbEnabled(true);
+        startListening();
+      } else {
+        _uid=null;
+        setFbEnabled(false);
+        loadLocalAll();
+        setLoaded(true);
+      }
+    });
+    return ()=>unsub();
   },[]);
+
+  // Old cfg-based init removed (auth handles it now)
+  useEffect(()=>{
+    if(!authReady) return; // wait for auth
+    // If not logged in, just load local
+  },[authReady]);
 
   const loadLocalAll = () => {
     setJobs(loadJobs()); setTires(loadTires()||INITIAL_TIRES); setTireSales(loadSales()); setReceipts(loadReceipts());
@@ -2079,6 +2457,16 @@ function App(){
   const tabTitles={"dashboard":"Dashboard","add":"Add Job","history":"History","payouts":"Payouts","inventory":"Inventory","settings":"Settings"};
 
   if(showSetup) return <SetupScreen onComplete={handleSetupComplete} onSkip={()=>{setShowSetup(false);setLoaded(true);}}/>;
+  // Auth gate
+  if(!authReady) return (
+    <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,background:"#111"}}>
+      <img src={`data:image/png;base64,${LOGO}`} style={{width:64,height:64,objectFit:"contain",borderRadius:12}}/>
+      <div style={{color:"#555",fontSize:13,fontFamily:"IBM Plex Sans,sans-serif",letterSpacing:1}}>Loading...</div>
+    </div>
+  );
+
+  if(!user) return <AuthScreen onAuth={(u)=>{ setUser(u); _uid=u.uid; }}/>;
+
   if(!loaded) return (
     <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,background:"#111"}}>
       <img src={`data:image/png;base64,${LOGO}`} style={{width:64,height:64,objectFit:"contain",borderRadius:12}}/>
