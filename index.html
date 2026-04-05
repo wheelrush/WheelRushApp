@@ -334,17 +334,22 @@ const saveFBCfg    = c => { try{localStorage.setItem("wr-firebase-cfg",JSON.stri
 let _db=null, _auth=null, _uid=null, _jobUnsub=null, _tireUnsub=null;
 const jSavingRef={current:false}, tSavingRef={current:false};
 
-// ── Firebase init ──
+// ── Firebase init — called ONCE at startup ──
+const FB_CFG={apiKey:"AIzaSyA7q8zr9Ilygu-2Weds8VO2Z9xy9dK51HE",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
+
 function initFB(cfg){
   try{
-    if(firebase.apps.length>0) firebase.apps[0].delete();
-    const app=firebase.initializeApp(cfg);
-    _db=firebase.firestore(app);
-    _auth=firebase.auth(app);
+    // Never delete existing app — just reuse it
+    const app = firebase.apps.length>0 ? firebase.apps[0] : firebase.initializeApp(cfg||FB_CFG);
+    _db   = firebase.firestore(app);
+    _auth = firebase.auth(app);
     _db.enablePersistence({synchronizeTabs:true}).catch(()=>{});
     return true;
-  }catch(e){return false;}
+  }catch(e){ console.error("Firebase init error:",e); return false; }
 }
+
+// Init immediately on load — before any React component mounts
+initFB(FB_CFG);
 
 // ── User-scoped collection helpers ──
 const userCol = (name) => (_db&&_uid) ? _db.collection("users").doc(_uid).collection(name) : null;
@@ -369,7 +374,7 @@ const signUp   = (email,pw) => _auth.createUserWithEmailAndPassword(email,pw);
 const signIn   = (email,pw) => _auth.signInWithEmailAndPassword(email,pw);
 const resetPw  = (email)    => _auth.sendPasswordResetEmail(email);
 const signOut  = ()         => _auth.signOut();
-const onAuthChange = (cb)   => _auth ? _auth.onAuthStateChanged(cb) : ()=>{};
+const onAuthChange = (cb)   => { if(_auth) return _auth.onAuthStateChanged(cb); cb(null); return ()=>{}; };
 
 // ════════════════════════════════════════════
 // ── FINANCE ENGINE (co-owner, accrued model) ──
@@ -2237,12 +2242,6 @@ function AuthScreen({onAuth}){
   const [error,setError]     = useState("");
   const [msg,setMsg]         = useState("");
 
-  // Auto-init Firebase with hardcoded config
-  useEffect(()=>{
-    const cfg={apiKey:"AIzaSyA7q8zr9Ilygu-2Weds8VO2Z9xy9dK51HE",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
-    initFB(cfg);
-  },[]);
-
   const handleSubmit = async() => {
     setError(""); setMsg("");
     if(!email.trim()||(!password&&mode!=="reset")){setError("Fill in all fields.");return;}
@@ -2363,8 +2362,7 @@ function App(){
 
   // ── Auth state listener ──
   useEffect(()=>{
-    const cfg={apiKey:"AIzaSyA7q8zr9Ilygu-2Weds8VO2Z9xy9dK51HE",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
-    initFB(cfg);
+    // Firebase already initialized globally — just listen for auth state
     const unsub = onAuthChange((u)=>{
       setUser(u);
       setAuthReady(true);
