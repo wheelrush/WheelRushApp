@@ -14,6 +14,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
@@ -334,16 +335,25 @@ let _db=null, _jobUnsub=null, _tireUnsub=null;
 const jSavingRef={current:false}, tSavingRef={current:false};
 
 // ── Firebase init ──
-const FB_CFG={apiKey:"AIzaSyBOwfEmeSCbhCSQB2HYorkWTUbL4es_ntY",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
+const FB_CFG={apiKey:"AIzaSyA7q8zr9IIygu-2Weds8VO2Z9xy9dK51HE",authDomain:"wheel-rush-expense.firebaseapp.com",projectId:"wheel-rush-expense",storageBucket:"wheel-rush-expense.firebasestorage.app",messagingSenderId:"400580006654",appId:"1:400580006654:web:b8e435c2807b51af244baf"};
+
+let _auth = null;
 
 function initFB(cfg){
   try{
     const app = firebase.apps.length>0 ? firebase.apps[0] : firebase.initializeApp(cfg||FB_CFG);
-    _db = firebase.firestore(app);
+    _db   = firebase.firestore(app);
+    _auth = firebase.auth(app);
     _db.enablePersistence({synchronizeTabs:true}).catch(()=>{});
     return true;
   }catch(e){ return false; }
 }
+
+const fbSignIn      = (email,pw)  => _auth.signInWithEmailAndPassword(email,pw);
+const fbSignInGoogle= ()          => _auth.signInWithPopup(new firebase.auth.GoogleAuthProvider());
+const fbResetPw     = (email)     => _auth.sendPasswordResetEmail(email);
+const fbSignOut     = ()          => _auth.signOut();
+const fbOnAuth      = (cb)        => _auth ? _auth.onAuthStateChanged(cb) : (cb(null),()=>{});
 
 // Init immediately on load
 initFB(FB_CFG);
@@ -2193,8 +2203,17 @@ function SettingsScreen({jobs, setJobs, settings, setSettings, fbEnabled, syncSt
       <div className="page">
         {msg&&<div className="success-box">{msg}</div>}
 
+        {/* Account */}
+        <div className="section-label" style={{marginTop:0}}>👤 Account</div>
+        <div className="settings-card">
+          <div className="settings-row">
+            <div><div className="settings-label">Signed In</div><div className="settings-sub">{fbEnabled?"Cloud syncing":"Offline mode"}</div></div>
+            <button onClick={async()=>{ if(window.confirm("Sign out?")){try{await fbSignOut();}catch(e){} window.location.reload();} }} style={{background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:8,padding:"8px 16px",fontSize:12,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer"}}>Sign Out</button>
+          </div>
+        </div>
+
         {/* Cloud Sync */}
-        <div className="section-label" style={{marginTop:0}}>☁️ Cloud Sync</div>
+        <div className="section-label">☁️ Cloud Sync</div>
         <div className="settings-card">
           <div className="settings-row">
             <div><div className="settings-label" style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:8,height:8,borderRadius:"50%",background:syncColor,boxShadow:syncStatus==="connected"?`0 0 6px ${syncColor}`:""}}></div>{fbEnabled?"Firebase Connected":"Not Connected"}</div><div className="settings-sub">{{"connected":"Syncing across all devices","syncing":"Syncing...","offline":"Tap Set Up to connect","error":"Connection error — tap Reconnect"}[syncStatus]}</div></div>
@@ -2331,6 +2350,142 @@ function SettingsScreen({jobs, setJobs, settings, setSettings, fbEnabled, syncSt
 // ────────────────────────────────────────────────
 // ── SETUP SCREEN ──
 // ────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────
+// ── AUTH SCREEN ──
+// ────────────────────────────────────────────────
+function AuthScreen({onAuth}){
+  const [email,setEmail]   = useState("contact@wheelrush.net");
+  const [pw,setPw]         = useState("");
+  const [mode,setMode]     = useState("login"); // login | reset
+  const [err,setErr]       = useState("");
+  const [msg,setMsg]       = useState("");
+  const [loading,setLoading] = useState(false);
+
+  const errMap = {
+    "auth/user-not-found":"No account found with that email.",
+    "auth/wrong-password":"Incorrect password. Try again.",
+    "auth/invalid-email":"Please enter a valid email.",
+    "auth/too-many-requests":"Too many attempts. Try again later.",
+    "auth/invalid-credential":"Incorrect email or password.",
+    "auth/popup-closed-by-user":"Google sign-in was cancelled.",
+    "auth/network-request-failed":"Network error. Check your connection.",
+  };
+
+  const handleEmail = async() => {
+    if(!email.trim()||!pw){ setErr("Enter your email and password."); return; }
+    setLoading(true); setErr("");
+    try{
+      const cred = await fbSignIn(email.trim(), pw);
+      onAuth(cred.user);
+    }catch(e){ setErr(errMap[e.code]||"Sign in failed. Try again."); }
+    setLoading(false);
+  };
+
+  const handleGoogle = async() => {
+    setLoading(true); setErr("");
+    try{
+      const cred = await fbSignInGoogle();
+      onAuth(cred.user);
+    }catch(e){ setErr(errMap[e.code]||"Google sign-in failed."); }
+    setLoading(false);
+  };
+
+  const handleReset = async() => {
+    if(!email.trim()){ setErr("Enter your email first."); return; }
+    setLoading(true); setErr("");
+    try{
+      await fbResetPw(email.trim());
+      setMsg("Reset email sent — check your inbox.");
+      setMode("login");
+    }catch(e){ setErr(errMap[e.code]||"Could not send reset email."); }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{minHeight:"100%",background:"#111",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px 20px"}}>
+      {/* Logo */}
+      <img src={`data:image/png;base64,${LOGO}`} style={{width:90,height:90,borderRadius:20,objectFit:"contain",marginBottom:20,boxShadow:"0 4px 24px rgba(0,0,0,0.4)"}} alt="Wheel Rush"/>
+      <div style={{fontSize:26,fontWeight:700,color:"#fff",letterSpacing:"-0.5px",marginBottom:4}}>Wheel Rush</div>
+      <div style={{fontSize:13,color:"#555",marginBottom:36}}>Mobile Tire Repair Tracker</div>
+
+      {/* Card */}
+      <div style={{background:"#1a1a1a",borderRadius:20,padding:"28px 24px",width:"100%",maxWidth:380,border:"1px solid #222"}}>
+        <div style={{fontSize:18,fontWeight:700,color:"#fff",marginBottom:4}}>
+          {mode==="login"?"Welcome back":"Reset password"}
+        </div>
+        <div style={{fontSize:13,color:"#555",marginBottom:22}}>
+          {mode==="login"?"Sign in to your account":"Enter your email to receive a reset link"}
+        </div>
+
+        {err&&<div style={{background:"#2a0000",border:"1px solid #500",borderRadius:10,padding:"10px 14px",fontSize:13,color:"#f87171",marginBottom:16}}>{err}</div>}
+        {msg&&<div style={{background:"#002a00",border:"1px solid #050",borderRadius:10,padding:"10px 14px",fontSize:13,color:"#4ade80",marginBottom:16}}>{msg}</div>}
+
+        {/* Email field */}
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:11,fontWeight:600,color:"#555",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:6}}>Email</div>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)} autoCapitalize="none" autoCorrect="off"
+            style={{width:"100%",background:"#111",border:"1.5px solid #333",borderRadius:10,padding:"13px 14px",fontSize:15,fontFamily:"IBM Plex Sans,sans-serif",color:"#fff",outline:"none"}}/>
+        </div>
+
+        {/* Password field */}
+        {mode==="login"&&(
+          <div style={{marginBottom:20}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#555",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:6}}>Password</div>
+            <input type="password" value={pw} onChange={e=>setPw(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&handleEmail()}
+              style={{width:"100%",background:"#111",border:"1.5px solid #333",borderRadius:10,padding:"13px 14px",fontSize:15,fontFamily:"IBM Plex Sans,sans-serif",color:"#fff",outline:"none"}}/>
+          </div>
+        )}
+
+        {/* Sign in button */}
+        {mode==="login"?(
+          <button onClick={handleEmail} disabled={loading}
+            style={{width:"100%",background:"#ea580c",color:"#fff",border:"none",borderRadius:12,padding:"15px",fontSize:16,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer",marginBottom:12}}>
+            {loading?"Signing in...":"Sign In"}
+          </button>
+        ):(
+          <button onClick={handleReset} disabled={loading}
+            style={{width:"100%",background:"#ea580c",color:"#fff",border:"none",borderRadius:12,padding:"15px",fontSize:16,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer",marginBottom:12}}>
+            {loading?"Sending...":"Send Reset Email"}
+          </button>
+        )}
+
+        {/* Divider */}
+        {mode==="login"&&(
+          <>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+              <div style={{flex:1,height:1,background:"#2a2a2a"}}/>
+              <span style={{fontSize:11,color:"#444"}}>or</span>
+              <div style={{flex:1,height:1,background:"#2a2a2a"}}/>
+            </div>
+
+            {/* Google button */}
+            <button onClick={handleGoogle} disabled={loading}
+              style={{width:"100%",background:"#fff",color:"#111",border:"none",borderRadius:12,padding:"14px",fontSize:15,fontFamily:"IBM Plex Sans,sans-serif",fontWeight:700,cursor:"pointer",marginBottom:20,display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
+              <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="none" d="M0 0h48v48H0z"/></svg>
+              Continue with Google
+            </button>
+          </>
+        )}
+
+        {/* Footer links */}
+        <div style={{textAlign:"center",fontSize:13,color:"#444"}}>
+          {mode==="login"?(
+            <button onClick={()=>{setMode("reset");setErr("");setMsg("");}} style={{background:"none",border:"none",color:"#666",cursor:"pointer",fontFamily:"IBM Plex Sans,sans-serif",fontSize:13,textDecoration:"underline"}}>
+              Forgot password?
+            </button>
+          ):(
+            <button onClick={()=>{setMode("login");setErr("");setMsg("");}} style={{background:"none",border:"none",color:"#ea580c",cursor:"pointer",fontFamily:"IBM Plex Sans,sans-serif",fontSize:13,fontWeight:700}}>
+              Back to sign in
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SetupScreen({onComplete, onSkip}){
   const [error,setError] = useState("");
   const [loading,setLoading] = useState(false);
@@ -2368,6 +2523,8 @@ function SetupScreen({onComplete, onSkip}){
 }
 
 function App(){
+  const [user,      setUser]      = useState(null);
+  const [authReady, setAuthReady] = useState(false);
   const [tab,       setTab]       = useState("dashboard");
   const [jobs,      setJobs]      = useState([]);
   const [tires,     setTires]     = useState(INITIAL_TIRES);
@@ -2381,27 +2538,20 @@ function App(){
   const retryRef = useRef(null);
 
   useEffect(()=>{
-    // Auto-connect to Firebase (already initialized globally)
-    const tryConnect = async() => {
-      try{
-        if(!_db) initFB(FB_CFG);
-        // Test connection
-        await _db.collection("wheelrush_jobs").limit(1).get();
-        setFbEnabled(true);
-        startListening();
-        saveFBCfg(FB_CFG);
-      }catch(e){
-        // Still set up listener - Firestore offline cache works
-        if(_db){
-          setFbEnabled(true);
-          startListening();
-        } else {
-          loadLocalAll();
-          setLoaded(true);
-        }
+    // Firebase already inited globally — listen for auth state
+    const unsub = fbOnAuth((u)=>{
+      setUser(u);
+      setAuthReady(true);
+      if(u){
+        // User is signed in — connect Firestore
+        if(_db){ setFbEnabled(true); startListening(); }
+      } else {
+        // Not signed in — load local data
+        loadLocalAll();
+        setLoaded(true);
       }
-    };
-    tryConnect();
+    });
+    return ()=>unsub();
   },[]);
 
   const loadLocalAll = () => {
@@ -2473,6 +2623,17 @@ function App(){
   const tabTitles={"dashboard":"Dashboard","add":"Add Job","history":"History","payouts":"Payouts","inventory":"Inventory","expenses":"Expenses","settings":"Settings"};
 
   if(showSetup) return <SetupScreen onComplete={handleSetupComplete} onSkip={()=>{setShowSetup(false);setLoaded(true);}}/>;
+  // Waiting for Firebase auth to resolve
+  if(!authReady) return (
+    <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,background:"#111"}}>
+      <img src={`data:image/png;base64,${LOGO}`} style={{width:64,height:64,objectFit:"contain",borderRadius:12}}/>
+      <div style={{color:"#555",fontSize:13,fontFamily:"IBM Plex Sans,sans-serif",letterSpacing:1}}>Loading...</div>
+    </div>
+  );
+
+  // Show login if not signed in
+  if(!user) return <AuthScreen onAuth={(u)=>setUser(u)}/>;
+
   if(!loaded) return (
     <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,background:"#111"}}>
       <img src={`data:image/png;base64,${LOGO}`} style={{width:64,height:64,objectFit:"contain",borderRadius:12}}/>
