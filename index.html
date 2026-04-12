@@ -77,10 +77,10 @@
     .pill.blue{background:#dbeafe;color:#1d4ed8}
     .field{margin-bottom:14px}
     .field label{display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:#888;margin-bottom:7px}
-    .field input,.field select,.field textarea{width:100%;border:1.5px solid #e3e3e3;background:#fff;border-radius:12px;padding:12px 14px;outline:none;transition:border-color .15s}
+    .field input,.field select,.field textarea{width:100%;border:1.5px solid #e3e3e3;background:#fff;border-radius:12px;padding:12px 14px;outline:none;transition:border-color .15s;min-width:0;box-sizing:border-box}
     .field input:focus,.field select:focus,.field textarea:focus{border-color:#111}
     .field textarea{min-height:72px;resize:vertical}
-    .field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;min-width:0}
     .chip-row{display:flex;flex-wrap:wrap;gap:7px;margin-top:2px}
     .chip{border:1.5px solid #ddd;background:#fff;border-radius:999px;padding:7px 12px;font-size:12px;font-weight:700;color:#666;transition:all .12s}
     .chip.active{background:#111;color:#fff;border-color:#111}
@@ -205,6 +205,85 @@ const { useCallback, useEffect, useMemo, useState, useRef } = React;
 // STORAGE
 // ─────────────────────────────────────────────────────────────────────────────
 const KEYS = { jobs:'wr2-jobs-v2', settings:'wr2-settings-v2', inventory:'wr2-inventory-v2', expenses:'wr2-expenses-v1', sizes:'wr2-recent-sizes-v1' };
+
+// Migrate jobs from ALL previous app versions into current key
+function migrateOldJobs() {
+  const OLD_KEYS = [
+    'wr-jobs-v5',           // WheelRush-App.html (Firebase version)
+    'wr-upgraded-jobs-v1',  // WheelRush-Upgraded.html
+    'wr2-jobs-v1',          // WheelRush-Upgraded v2
+    'wheelrush_jobs',       // Firebase collection local cache
+  ];
+  const current = load(KEYS.jobs, []);
+  const currentIds = new Set(current.map(j => String(j.id)));
+  let migrated = [...current];
+  let count = 0;
+  OLD_KEYS.forEach(k => {
+    try {
+      const old = load(k, []);
+      if (Array.isArray(old) && old.length > 0) {
+        old.forEach(j => {
+          if (!currentIds.has(String(j.id))) {
+            // Normalize old job format to new format
+            migrated.push({
+              ...j,
+              id: String(j.id || Date.now()),
+              source: j.source || 'Google Search',
+              tireCost: j.tireCost || j.cost || 0,
+              miscCost: j.miscCost || 0,
+            });
+            currentIds.add(String(j.id));
+            count++;
+          }
+        });
+      }
+    } catch {}
+  });
+  if (count > 0) {
+    persist(KEYS.jobs, migrated);
+    console.log('Migrated ' + count + ' jobs from old storage keys');
+  }
+  return migrated;
+}
+
+// Migrate inventory from ALL previous app versions
+function migrateOldInventory() {
+  const OLD_INV_KEYS = [
+    'wr-tires-v1',               // WheelRush-App.html (Firebase version)
+    'wr-upgraded-inventory-v1',  // WheelRush-Upgraded.html
+    'wr2-inventory-v1',          // WheelRush-Upgraded v2
+  ];
+  const current = load(KEYS.inventory, []);
+  // If current has meaningful data (user manually added items beyond defaults),
+  // or has more than the 4 default items, keep it
+  const hasRealData = current.length > 0 && current.some(i => i.qty > 0 && i.size && !['225/60R17','235/45R18','215/55R17','245/40R19'].includes(i.size));
+  
+  let best = current;
+  // Find the largest inventory dataset across all old keys
+  OLD_INV_KEYS.forEach(k => {
+    try {
+      const old = load(k, []);
+      if (Array.isArray(old) && old.length > best.length) {
+        best = old;
+      }
+    } catch {}
+  });
+  
+  // If we found a bigger dataset from old keys, use it (normalized to new format)
+  if (best !== current) {
+    const normalized = best.map(item => ({
+      id:    item.id ? String(item.id) : ('i' + Math.random().toString(36).slice(2,8)),
+      size:  item.size || '',
+      qty:   Number(item.qty || item.quantity || 0),
+      cost:  Number(item.cost || item.price || 0),
+      notes: item.notes || '',
+    }));
+    persist(KEYS.inventory, normalized);
+    console.log('Migrated inventory: ' + normalized.length + ' sizes, ' + normalized.reduce((s,i)=>s+i.qty,0) + ' total tires');
+    return normalized;
+  }
+  return best;
+}
 const load    = (k, fb) => { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; } catch { return fb; } };
 const persist = (k, v)  => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
@@ -724,13 +803,15 @@ function AddJob({ onSave, settings, jobs, prefill, onClearPrefill }) {
       <div className="section-label" style={{marginTop:0}}>New Job</div>
       {error&&<div style={{background:'#fee2e2',border:'1px solid #fca5a5',borderRadius:10,padding:'10px 14px',fontSize:13,color:'#b91c1c',marginBottom:14,fontWeight:600}}>{error}</div>}
 
+      {/* Date + Service — stacked to avoid overlap on mobile */}
       <div className="field-row">
         <div className="field"><label>Date</label><input type="date" value={form.date} onChange={e=>setF('date',e.target.value)}/></div>
-        <div className="field"><label>Service</label><select value={form.service} onChange={e=>setF('service',e.target.value)}>{SERVICE_OPTIONS.map(s=><option key={s}>{s}</option>)}</select></div>
+        <div className="field"><label>Lead Source</label><select value={form.source} onChange={e=>setF('source',e.target.value)}>{SOURCE_OPTIONS.map(s=><option key={s}>{s}</option>)}</select></div>
       </div>
+      <div className="field"><label>Service</label><select value={form.service} onChange={e=>setF('service',e.target.value)} style={{width:'100%'}}>{SERVICE_OPTIONS.map(s=><option key={s}>{s}</option>)}</select></div>
       <div className="field-row">
         <div className="field"><label>Area</label><select value={form.area} onChange={e=>setF('area',e.target.value)}>{AREA_OPTIONS.map(a=><option key={a}>{a}</option>)}</select></div>
-        <div className="field"><label>Lead Source</label><select value={form.source} onChange={e=>setF('source',e.target.value)}>{SOURCE_OPTIONS.map(s=><option key={s}>{s}</option>)}</select></div>
+        <div className="field"><label>Status</label><select value={form.status} onChange={e=>setF('status',e.target.value)}><option>Completed</option><option>Pending</option></select></div>
       </div>
       <div className="field-row">
         <div className="field"><label>Job Price ($)</label><input type="number" min="0" inputMode="decimal" value={form.revenue} onChange={e=>setF('revenue',e.target.value)} placeholder={String(suggested)} style={{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700}}/></div>
@@ -752,12 +833,9 @@ function AddJob({ onSave, settings, jobs, prefill, onClearPrefill }) {
 
       <div className="field-row">
         <div className="field"><label>Qty</label><input type="number" min="1" value={form.qty} onChange={e=>setF('qty',e.target.value)}/></div>
-        <div className="field"><label>Status</label><select value={form.status} onChange={e=>setF('status',e.target.value)}><option>Completed</option><option>Pending</option></select></div>
-      </div>
-      <div className="field-row">
-        <div className="field"><label>Customer Name</label><input value={form.customerName} onChange={e=>setF('customerName',e.target.value)} placeholder="Optional"/></div>
         <div className="field"><label>Customer Phone</label><input type="tel" value={form.customerPhone} onChange={e=>setF('customerPhone',e.target.value)} placeholder="Optional"/></div>
       </div>
+      <div className="field"><label>Customer Name</label><input value={form.customerName} onChange={e=>setF('customerName',e.target.value)} placeholder="Optional" style={{width:'100%'}}/></div>
 
       {/* Payment tap grid */}
       <div className="field">
@@ -1251,9 +1329,9 @@ function App() {
   const [user,      setUser]      = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [tab,       setTab]       = useState('dashboard');
-  const [jobs,      setJobs]      = useState(()=>load(KEYS.jobs,[]));
+  const [jobs,      setJobs]      = useState(()=>migrateOldJobs());
   const [settings,  setSettings]  = useState(()=>({...DEFAULT_SETTINGS,...load(KEYS.settings,{})}));
-  const [inventory, setInventory] = useState(()=>load(KEYS.inventory, DEFAULT_INVENTORY));
+  const [inventory, setInventory] = useState(()=>migrateOldInventory());
   const [expenses,  setExpenses]  = useState(()=>load(KEYS.expenses,[]));
   const [prefill,   setPrefill]   = useState(null);
   const [sync,      setSync]      = useState('local');
@@ -1269,8 +1347,42 @@ function App() {
   useEffect(()=>{
     if(!user||!_db) return;
     setSync('syncing');
-    const u1 = fbListen(jobCol(), docs=>{ setJobs(docs); persist(KEYS.jobs,docs); setSync('connected'); });
-    const u2 = fbListen(invCol(), docs=>{ if(docs.length) setInventory(docs); });
+    const u1 = fbListen(jobCol(), docs=>{
+      // Only overwrite local if Firebase actually has data
+      // This prevents losing local jobs when first signing in
+      if (docs.length > 0) {
+        // Merge: Firebase is source of truth, but keep any local jobs not yet uploaded
+        const localJobs = load(KEYS.jobs, []);
+        const fbIds = new Set(docs.map(d => String(d.id)));
+        const localOnly = localJobs.filter(j => !fbIds.has(String(j.id)));
+        const merged = [...docs, ...localOnly];
+        setJobs(merged);
+        persist(KEYS.jobs, merged);
+        // Upload any local-only jobs to Firebase
+        localOnly.forEach(j => fbSet(jobCol(), j.id, j));
+      } else {
+        // Firebase returned 0 docs — upload our local jobs instead of deleting them
+        const localJobs = load(KEYS.jobs, []);
+        if (localJobs.length > 0) {
+          fbSetAll(jobCol(), localJobs);
+          setJobs(localJobs);
+        }
+      }
+      setSync('connected');
+    });
+    const u2 = fbListen(invCol(), docs=>{
+      if (docs.length > 0) {
+        // Firebase has inventory — use it (it's the sync source of truth)
+        setInventory(docs);
+        persist(KEYS.inventory, docs);
+      } else {
+        // Firebase empty — upload our local inventory to it
+        const localInv = load(KEYS.inventory, []);
+        if (localInv.length > 0) {
+          fbSetAll(invCol(), localInv);
+        }
+      }
+    });
     const u3 = fbListen(expCol(), docs=>{ setExpenses(docs); persist(KEYS.expenses,docs); });
     return ()=>{ u1(); u2(); u3(); };
   },[user]);
