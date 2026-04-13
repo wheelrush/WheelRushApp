@@ -368,7 +368,7 @@ function AuthScreen({onAuth}){
 }
 
 // ── JOB MODAL ─────────────────────────────────────────────────────────────────
-function JobModal({job,onClose,onSave,settings,services}){
+function JobModal({job,onClose,onSave,settings,weekGross=0}){
   const isEdit=!!(job&&job.id);
   const storedSizes=useMemo(()=>ls(KEYS.sizes,[]).slice(0,6),[]);
   const [form,setForm]=useState(job?.id?{...EMPTY_JOB(),...job,revenue:String(job.revenue||''),tireCost:String(job.tireCost||''),miscCost:String(job.miscCost||''),miles:String(job.miles||'')}:EMPTY_JOB());
@@ -379,6 +379,8 @@ function JobModal({job,onClose,onSave,settings,services}){
   const gross=(Number(form.revenue||0)||sugg)-dc;
   const target=/replacement|installation/i.test(form.service)?Number(settings.replacementTarget||110):Number(settings.repairTarget||90);
   const atTarget=gross>=target;
+  // Decision badge — uses real revenue if entered, else suggested
+  const dec=useMemo(()=>jobDecision({...form,revenue:Number(form.revenue||0)||sugg},settings,weekGross),[form,settings,sugg,weekGross]);
 
   return(
     <div style={{position:'fixed',inset:0,background:'#000C',zIndex:1000,display:'flex',alignItems:'flex-end',justifyContent:'center'}} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
@@ -402,20 +404,27 @@ function JobModal({job,onClose,onSave,settings,services}){
           <FInput label="Misc Cost ($)" type="number" value={form.miscCost} onChange={v=>sf('miscCost',v)} placeholder="0"/>
         </div>
 
-        {/* Profit preview */}
-        {(form.revenue||form.tireCost||form.miscCost||form.miles)&&(
-          <div style={{background:atTarget?C.successDim:C.warnDim,border:`1px solid ${atTarget?C.success+'44':C.warn+'44'}`,borderRadius:12,padding:12,marginBottom:12}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              <div>
-                <div style={{fontSize:11,color:C.muted,fontWeight:600}}>Gross Profit Preview</div>
-                <div style={{fontFamily:'"JetBrains Mono",monospace',fontSize:24,fontWeight:900,color:atTarget?C.success:gross>=0?C.warn:C.danger}}>{money(gross)}</div>
+        {/* Profit preview + decision badge — always visible once any number entered */}
+        <div style={{background:dec.bg,border:`1px solid ${dec.color}33`,borderRadius:14,padding:'12px 14px',marginBottom:14}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+            <div>
+              <div style={{fontSize:10,fontWeight:700,letterSpacing:'0.08em',color:C.muted,textTransform:'uppercase',marginBottom:3}}>
+                {form.revenue?'Gross Profit':'Suggested Price'}
               </div>
-              <div style={{textAlign:'right',fontSize:12,color:atTarget?C.success:C.warn,fontWeight:700}}>
-                {atTarget?'✓ Above target':gross>=0?`⚠ Below ${fmt(target)} target`:'⚠ Loss'}
+              <div style={{fontFamily:'"JetBrains Mono",monospace',fontSize:28,fontWeight:900,color:dec.color,lineHeight:1}}>
+                {form.revenue?money(gross):money(sugg)}
               </div>
             </div>
+            <div style={{background:dec.color,color:'#fff',borderRadius:10,padding:'8px 14px',fontWeight:900,fontSize:15,letterSpacing:'0.02em'}}>
+              {dec.label}
+            </div>
           </div>
-        )}
+          <div style={{fontSize:11,color:C.muted}}>
+            {form.revenue
+              ? `${money(dc)} cost · ${atTarget?'✓ Above':'⚠ Below'} ${fmt(target)} target`
+              : `${money(dc)} direct cost · enter price to override`}
+          </div>
+        </div>
 
         {/* Tire size */}
         <FInput label="Tire Size" value={form.tireSize} onChange={v=>sf('tireSize',v)} placeholder="e.g. 225/55R17"/>
@@ -959,15 +968,38 @@ function Settings({settings,setSettings,jobs,inventory,varExpenses,user,sync,onS
 
       <SectionLabel>Owners & Payout</SectionLabel>
       <Card>
-        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-          <FInput label="Owner 1 Name" value={s.owner1Name||''} onChange={v=>set('owner1Name',v)}/>
-          <FInput label="Split %" type="number" value={s.profitSplit1||50} onChange={v=>set('profitSplit1',Number(v||0))}/>
-        </div>
-        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-          <FInput label="Owner 2 Name" value={s.owner2Name||''} onChange={v=>set('owner2Name',v)}/>
-          <FInput label="Split %" type="number" value={s.profitSplit2||50} onChange={v=>set('profitSplit2',Number(v||0))}/>
-        </div>
-        {Number(s.profitSplit1||0)+Number(s.profitSplit2||0)!==100&&<div style={{fontSize:12,color:C.warn,fontWeight:600,marginBottom:8}}>⚠️ Splits must add to 100% (currently {Number(s.profitSplit1||0)+Number(s.profitSplit2||0)}%)</div>}
+        {[{nk:'owner1Name',pk:'profitSplit1',ak:'owner1Active',label:'Owner 1'},{nk:'owner2Name',pk:'profitSplit2',ak:'owner2Active',label:'Owner 2'}].map(({nk,pk,ak,label})=>{
+          const isOn=s[ak]!==false;
+          return(
+            <div key={nk} style={{padding:'12px 0',borderBottom:`1px solid ${C.border}`,opacity:isOn?1:0.45,lastChild:{borderBottom:'none'}}}>
+              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:isOn?10:0}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.text}}>{label}</div>
+                {/* Toggle on/off */}
+                <button onClick={()=>set(ak,!isOn)} style={{
+                  width:44,height:26,borderRadius:13,border:'none',cursor:'pointer',
+                  background:isOn?C.orange:C.subtle,position:'relative',flexShrink:0,
+                  transition:'background .2s'
+                }}>
+                  <div style={{position:'absolute',top:3,left:isOn?21:3,width:20,height:20,borderRadius:10,background:'#fff',transition:'left .2s',boxShadow:'0 1px 3px #0004'}}/>
+                </button>
+              </div>
+              {isOn&&(
+                <div style={{display:'grid',gridTemplateColumns:'1fr auto',gap:10,alignItems:'center'}}>
+                  <input value={s[nk]||''} onChange={e=>set(nk,e.target.value)} placeholder={label+' name'}
+                    style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:'10px 12px',color:C.text,fontSize:14,outline:'none',fontFamily:'inherit',width:'100%'}}/>
+                  <div>
+                    <div style={{fontSize:10,color:C.muted,marginBottom:4,textAlign:'center'}}>Split %</div>
+                    <input type="number" min="0" max="100" value={s[pk]||0} onChange={e=>set(pk,Number(e.target.value||0))}
+                      style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:'10px 0',color:C.text,fontSize:14,fontFamily:'"JetBrains Mono",monospace',fontWeight:700,outline:'none',width:72,textAlign:'center'}}/>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {(s.owner1Active!==false&&s.owner2Active!==false)&&(Number(s.profitSplit1||0)+Number(s.profitSplit2||0))!==100&&(
+          <div style={{fontSize:12,color:C.warn,fontWeight:600,paddingTop:10}}>⚠️ Splits must add to 100% (currently {Number(s.profitSplit1||0)+Number(s.profitSplit2||0)}%)</div>
+        )}
       </Card>
 
       <SectionLabel>Goals & Tax</SectionLabel>
@@ -1127,7 +1159,7 @@ function App(){
     setShowJob(null);
   },[jobs,user]);
 
-  const delJob=useCallback(id=>{setJobs(prev=>prev.filter(j=>j.id!==id));if(user)fbDel(jobCol(),id);},[user]);
+  const delJob=useCallback(id=>{const sid=String(id);setJobs(prev=>prev.filter(j=>String(j.id)!==sid));if(user)fbDel(jobCol(),sid);},[user]);
   const signOut=async()=>{try{await _auth?.signOut();}catch{}setUser(null);setSync('local');authInit.current=false;};
 
   if(!authReady) return(
@@ -1155,6 +1187,7 @@ function App(){
         <JobModal
           job={showJob?.id?showJob:null}
           settings={settings}
+          weekGross={jobs.filter(j=>{const tw=getWeekStart(TODAY());return getWeekStart(j.date)===tw;}).reduce((s,j)=>s+jobGrossProfit(j,settings),0)}
           onClose={()=>setShowJob(null)}
           onSave={form=>{saveJob(form);}}
         />
