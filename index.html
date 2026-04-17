@@ -336,7 +336,10 @@ function migrateOldInventory() {
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const TODAY  = function() { return new Date().toISOString().slice(0,10); };
+const TODAY  = function() {
+  // Always return the current date in America/New_York (Miami) time
+  return new Date().toLocaleDateString('en-CA', {timeZone:'America/New_York'});
+};
 const uid    = function() { return Date.now().toString(36)+Math.random().toString(36).slice(2,6); };
 const clamp  = function(n,lo,hi) { return Math.min(hi,Math.max(lo,n)); };
 const r2     = function(n) { return Math.round((Number(n||0)+Number.EPSILON)*100)/100; };
@@ -444,20 +447,27 @@ function weekSummary(weekJobs, s) {
   return {revenue, directCosts, grossProfit, fixed, net, jobCount:jobs.length};
 }
 function getWeekStart(d) {
-  const dt = new Date(d+'T00:00:00'), day = dt.getDay();
+  const dt = new Date(d+'T12:00:00'), day = dt.getDay();
+  // Use noon to avoid any DST-edge midnight issues
   dt.setDate(dt.getDate() - (day >= 5 ? day-5 : day+2));
-  return dt.toISOString().slice(0,10);
+  return dt.toLocaleDateString('en-CA', {timeZone:'America/New_York'});
 }
 function weekLabel(s) {
-  const d = new Date(s+'T00:00:00'), e = new Date(d);
+  const d = new Date(s+'T12:00:00'), e = new Date(d);
   e.setDate(e.getDate()+6);
-  const f = function(dt) { return dt.toLocaleDateString('en-US',{month:'short',day:'numeric'}); };
-  return f(d)+' – '+f(e)+', '+e.getFullYear();
+  const f = function(dt) { return dt.toLocaleDateString('en-US',{timeZone:'America/New_York',month:'short',day:'numeric'}); };
+  return f(d)+' – '+f(e)+', '+e.toLocaleDateString('en-US',{timeZone:'America/New_York',year:'numeric'}).split('/')[2];
 }
 function nextFriday() {
-  const d = new Date(), diff = d.getDay()===5 ? 7 : (5-d.getDay()+7)%7;
-  d.setDate(d.getDate()+diff);
-  return d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
+  const now = new Date();
+  // Get current day-of-week in Miami time
+  const dayStr = now.toLocaleDateString('en-US',{timeZone:'America/New_York',weekday:'short'});
+  const dayMap = {Sun:0,Mon:1,Tue:2,Wed:3,Thu:4,Fri:5,Sat:6};
+  const day = dayMap[dayStr.slice(0,3)];
+  const diff = day===5 ? 7 : (5-day+7)%7;
+  const fri = new Date(now);
+  fri.setDate(fri.getDate()+diff);
+  return fri.toLocaleDateString('en-US',{timeZone:'America/New_York',weekday:'short',month:'short',day:'numeric'});
 }
 function groupByWeek(jobs) {
   const map = {};
@@ -1020,12 +1030,12 @@ function AddJob(props) {
         {isEditing && (
           <div style={{background:'#fef9c3',border:'1.5px solid #fde047',borderRadius:10,padding:'10px 14px',marginBottom:10,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <span style={{fontSize:13,fontWeight:700,color:'#854d0e'}}>✏️ Editing Job — {form.date}</span>
-            <button className="btn secondary sm" onClick={cancelEdit}>Cancel Edit</button>
+            <button className="btn secondary sm" onClick={function(){cancelEdit();}}>Cancel Edit</button>
           </div>
         )}
 
         <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
-          {lastJob && !isEditing && <button type="button" className="btn secondary sm" onClick={useLastJob}>↩ Use Last Job</button>}
+          {lastJob && !isEditing && <button type="button" className="btn secondary sm" onClick={function(){useLastJob();}}>↩ Use Last Job</button>}
           {prefill && !isEditing && <button type="button" className="btn orange sm">🔁 Repeating Job</button>}
           {!isEditing && <button type="button" className="btn secondary sm" onClick={function(){setForm(EMPTY_JOB());setSaved(null);setError('');setPriceMode('suggested');}}>✕ Clear</button>}
         </div>
@@ -1038,7 +1048,7 @@ function AddJob(props) {
             <button className="btn primary sm" onClick={function(){sendInvoice(saved,settings);}}>
               {'🧾 '+(saved.customerPhone?'Send Invoice':'Copy Invoice')}
             </button>
-            {saved.status==='Completed' && <button className="btn success sm" onClick={requestReview}>⭐ Review</button>}
+            {saved.status==='Completed' && <button className="btn success sm" onClick={function(){requestReview();}}>⭐ Review</button>}
             {saved.customerPhone && <button className="btn success sm" onClick={function(){window.open('tel:'+saved.customerPhone);}}>📞 Call</button>}
             <button className="btn secondary sm" onClick={function(){setForm({...saved,id:'',revenue:String(saved.revenue)});setSaved(null);}}>🔁 Dup</button>
           </div>
@@ -1139,14 +1149,14 @@ function AddJob(props) {
 
         <div className="field"><label>Notes</label><textarea value={form.note} onChange={function(e){setF('note',e.target.value);}} placeholder="Parking garage, roadside, no spare, etc."/></div>
         <div className="inline-note">Direct cost = travel + tire + misc. Weekly fixed deducted at payout only.</div>
-        {form.status==='Completed' && <button className="btn blue" style={{width:'100%',marginBottom:10}} onClick={requestReview}>{'⭐ Send Review'+(form.customerPhone?' via SMS':' (no phone)')}</button>}
+        {form.status==='Completed' && <button className="btn blue" style={{width:'100%',marginBottom:10}} onClick={function(){requestReview();}}>{'⭐ Send Review'+(form.customerPhone?' via SMS':' (no phone)')}</button>}
         <div style={{height:90}}/>
       </div>
 
       <div className="sticky-save">
         {isEditing ? (
           <div style={{display:'contents'}}>
-            <button className="btn secondary" onClick={cancelEdit}>Cancel Edit</button>
+            <button className="btn secondary" onClick={function(){cancelEdit();}}>Cancel Edit</button>
             <button className="btn primary" onClick={function(){saveJob(false);}}>Update Job ✓</button>
           </div>
         ) : (
@@ -1218,7 +1228,7 @@ function History(props) {
           <div style={{display:'flex',gap:5,marginTop:8,justifyContent:'flex-end',flexWrap:'wrap'}}>
             {onEdit && <button className="btn blue xs" onClick={function(){onEdit(job);}}>✏️</button>}
             <button className="btn success xs" onClick={function(){onRepeat(job);}}>🔁</button>
-            <button className="btn blue xs" onClick={sendReview}>⭐</button>
+            <button className="btn blue xs" onClick={function(){sendReview();}}>⭐</button>
             {job.status==='Pending' && <button className="btn success xs" onClick={function(){markPaid(job);}}>✓ Paid</button>}
             {job.customerPhone && <button className="btn secondary xs" onClick={function(){window.open('tel:'+job.customerPhone);}}>📞</button>}
             <button className="btn danger xs" onClick={function(){handleDelete(job.id);}}>×</button>
@@ -1650,7 +1660,29 @@ function App() {
         return item;
       });});
     }
-    const entry = {...job, id:job.id||uid()};
+    // Sanitize: only write known primitive fields to Firestore
+    const entry = {
+      id:            String(job.id||uid()),
+      date:          String(job.date||''),
+      service:       String(job.service||''),
+      area:          String(job.area||''),
+      payment:       String(job.payment||''),
+      status:        String(job.status||'Completed'),
+      source:        String(job.source||''),
+      customerName:  String(job.customerName||''),
+      customerPhone: String(job.customerPhone||''),
+      tireSize:      String(job.tireSize||''),
+      qty:           Number(job.qty||1),
+      revenue:       Number(job.revenue||0),
+      tireCost:      Number(job.tireCost||0),
+      miscCost:      Number(job.miscCost||0),
+      miles:         Number(job.miles||0),
+      note:          String(job.note||''),
+      emergency:     !!job.emergency,
+      lateNight:     !!job.lateNight,
+      highway:       !!job.highway,
+      weekend:       !!job.weekend,
+    };
     setJobs(function(prev){const next=[entry,...prev.filter(function(j){return j.id!==entry.id;})];persist(KEYS.jobs,next);return next;});
     if (user) { fbSet(jobCol(),entry.id,entry); }
     else {
@@ -1699,7 +1731,7 @@ function App() {
       {tab==='add'       && <AddJob onSave={saveJob} settings={settings} jobs={jobs} prefill={prefill} onClearPrefill={function(){setPrefill(null);}} editJob={editJob} onClearEdit={function(){setEditJob(null);}}/>}
       {tab==='history'   && <History jobs={jobs} settings={settings} onRepeat={function(j){setPrefill(j);setTab('add');}} onDelete={deleteJob} onEdit={handleEdit}/>}
       {tab==='payouts'   && <Payouts jobs={jobs} settings={settings}/>}
-      {tab==='expenses'  && <Expenses expenses={expenses} setExpenses={function(e){setExpenses(e);if(user)e.forEach(function(x){fbSet(expCol(),x.id,x);});}}/>}
+      {tab==='expenses'  && <Expenses expenses={expenses} setExpenses={function(e){setExpenses(e);if(user)e.forEach(function(x){fbSet(expCol(),x.id,{id:String(x.id||''),date:String(x.date||''),category:String(x.category||''),amount:Number(x.amount||0),note:String(x.note||'')});});}}/>}
       {tab==='inventory' && <Inventory inventory={inventory} setInventory={setInventory}/>}
       {tab==='settings'  && <Settings settings={settings} setSettings={setSettings} jobs={jobs} setJobs={setJobs} inventory={inventory} expenses={expenses}/>}
       <nav className="bottom-nav">
