@@ -297,7 +297,7 @@ const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
 // ── Storage ──────────────────────────────────────────────────────────────────
 const KEYS = {
-  jobs:'wr2-jobs-v2', settings:'wr2-settings-v2', inventory:'wr2-inventory-v2',
+  jobs:'wr2-jobs-v2', settings:'wr2-settings-v2', inventory:'wr2-inventory-v3',
   expenses:'wr2-expenses-v1', sizes:'wr2-recent-sizes-v1', cities:'wr2-recent-cities-v1',
 };
 const load    = (k, fb) => { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; } catch(e) { return fb; } };
@@ -323,16 +323,10 @@ function migrateOldJobs() {
 }
 
 function migrateOldInventory() {
-  const OLD = ['wr-tires-v1','wr-upgraded-inventory-v1','wr2-inventory-v1'];
-  const cur = load(KEYS.inventory, []); let best = cur;
-  OLD.forEach(function(k) {
-    try { const o = load(k, []); if (Array.isArray(o) && o.length > best.length) best = o; } catch(e) {}
-  });
-  if (best !== cur) {
-    const n = best.map(function(i) { return {id:i.id?String(i.id):('i'+Math.random().toString(36).slice(2,8)),size:i.size||'',qty:Number(i.qty||0),cost:Number(i.cost||0),notes:i.notes||''}; });
-    persist(KEYS.inventory, n); return n;
-  }
-  return best;
+  // v3 key: fresh inventory list loaded — do not migrate old sizes
+  const cur = load(KEYS.inventory, []);
+  if (cur.length > 0) return cur; // already have v3 data
+  return []; // return empty so App uses DEFAULT_INVENTORY
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -1516,6 +1510,7 @@ function Inventory(props) {
 function Settings(props) {
   const settings=props.settings, setSettings=props.setSettings;
   const jobs=props.jobs, setJobs=props.setJobs, inventory=props.inventory, expenses=props.expenses;
+  const setInventory=props.setInventory||function(){};
   const upd    = function(k,v){setSettings(function(p){return {...p,[k]:v};});};
   const updExp = function(id,patch){setSettings(function(p){return {...p,expenses:p.expenses.map(function(e){return e.id===id?{...e,...patch}:e;})};});};
   const addExp = function(){setSettings(function(p){return {...p,expenses:[...p.expenses,{id:uid(),name:'New Expense',amount:0,active:true}]};});};
@@ -1536,6 +1531,14 @@ function Settings(props) {
     inp.click();
   };
   const clearAll=function(){if(!window.confirm('Clear ALL data? Cannot be undone.'))return;Object.values(KEYS).forEach(function(k){localStorage.removeItem(k);});window.location.reload();};
+  const resetInventory=function(){
+    if(!window.confirm('Reset inventory to your 52-size list (91 tires)? This replaces current stock data.'))return;
+    const fresh=[...DEFAULT_INVENTORY];
+    setInventory(fresh);
+    persist(KEYS.inventory,fresh);
+    if(props.onResetInventory)props.onResetInventory(fresh);
+    alert('Inventory reset to your 52-size list. Total: 91 tires.');
+  };
   const monthly=monthlyFixed(settings), weekly=weeklyFixed(settings);
   const ao1=settings.owner1Active!==false, ao2=settings.owner2Active!==false;
   const splitTotal=(ao1?Number(settings.profitSplit1||0):0)+(ao2?Number(settings.profitSplit2||0):0);
@@ -1604,6 +1607,7 @@ function Settings(props) {
         <div className="card-row"><div><div className="label">Export CSV</div><div className="sub">For QuickBooks / Excel</div></div><button className="btn secondary sm" onClick={function(){exportCSV(jobs,settings);}}>CSV</button></div>
         <div className="card-row"><div><div className="label">Export Full Backup</div></div><button className="btn secondary sm" onClick={exportData}>JSON</button></div>
         <div className="card-row"><div><div className="label">Import Backup</div></div><button className="btn secondary sm" onClick={importData}>Import</button></div>
+        <div className="card-row"><div><div className="label">Reset Inventory to My List</div><div className="sub">91 tires · 52 sizes</div></div><button className="btn orange sm" onClick={function(){resetInventory();}}>Reset Stock</button></div>
         <div className="card-row"><div><div className="label">Reset Everything</div><div className="sub" style={{color:'#dc2626'}}>Cannot be undone</div></div><button className="btn danger sm" onClick={clearAll}>Reset</button></div>
       </div>
       <div style={{padding:'8px 0 4px',textAlign:'center',fontSize:11,color:'#ccc'}}>Wheel Rush Business Tracker · v5 · Firebase Sync</div>
@@ -1646,8 +1650,22 @@ function App() {
         setSync('connected');
       });
       const u2 = fbListen(invCol(), function(docs) {
-        if (docs.length>0) setInventory(docs);
-        else { const l=load(KEYS.inventory,[]); if(l.length>0) fbSetAll(invCol(),l); }
+        // If we have local v3 inventory already, trust it; otherwise use Firebase
+        const localInv = load(KEYS.inventory, []);
+        if (localInv.length > 0) {
+          // Local v3 exists — local is authoritative (already pushed or will push)
+          setInventory(localInv);
+        } else if (docs.length > 0) {
+          // No local v3 yet — Firebase has old data; overwrite with DEFAULT_INVENTORY
+          persist(KEYS.inventory, DEFAULT_INVENTORY);
+          setInventory(DEFAULT_INVENTORY);
+          fbSetAll(invCol(), DEFAULT_INVENTORY);
+        } else {
+          // Nothing anywhere — use defaults
+          persist(KEYS.inventory, DEFAULT_INVENTORY);
+          setInventory(DEFAULT_INVENTORY);
+          fbSetAll(invCol(), DEFAULT_INVENTORY);
+        }
       });
       const u3 = fbListen(expCol(), function(docs){setExpenses(docs);});
       const sDoc = settingDoc();
@@ -1781,7 +1799,7 @@ function App() {
       {tab==='payouts'   && <Payouts jobs={jobs} settings={settings}/>}
       {tab==='expenses'  && <Expenses expenses={expenses} setExpenses={function(e){setExpenses(e);if(user)e.forEach(function(x){fbSet(expCol(),x.id,{id:String(x.id||''),date:String(x.date||''),category:String(x.category||''),amount:Number(x.amount||0),note:String(x.note||'')});});}}/>}
       {tab==='inventory' && <Inventory inventory={inventory} setInventory={setInventory}/>}
-      {tab==='settings'  && <Settings settings={settings} setSettings={setSettings} jobs={jobs} setJobs={setJobs} inventory={inventory} expenses={expenses}/>}
+      {tab==='settings'  && <Settings settings={settings} setSettings={setSettings} jobs={jobs} setJobs={setJobs} inventory={inventory} expenses={expenses} setInventory={setInventory} onResetInventory={function(fresh){if(user)fbSetAll(invCol(),fresh);}}/>}
       <nav className="bottom-nav">
         {NAV.map(function(item){
           return <button key={item.id} className={'nav-btn'+(tab===item.id?' active':'')} onClick={function(){setTab(item.id);}}><span className="ico">{item.ico}</span>{item.label}</button>;
