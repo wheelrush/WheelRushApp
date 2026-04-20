@@ -958,7 +958,6 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
   const ringColor=goalPct>=100?"var(--green)":goalPct>=60?"var(--blue)":"var(--amber)";
 
   return html`<div class="screen"><div class="page page-enter">
-    <!-- ═══ PRO HERO SECTION ═══ -->
     <div class="pro-hero card-anim">
       <div style=${{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
         <div style=${{flex:1}}>
@@ -975,13 +974,11 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
             gross profit · ${weekJobs.length} job${weekJobs.length!==1?"s":""} · ${money(totals.revenue)} rev
           </div>
         </div>
-        <!-- Animated Progress Ring -->
         <${ProgressRing} size=${88} stroke=${6} pct=${goalPct} color=${ringColor}>
           <div style=${{fontFamily:"\"IBM Plex Mono\",monospace",fontSize:18,fontWeight:700,color:"var(--t1)",letterSpacing:"-1px"}}>${Math.round(goalPct)}%</div>
           <div style=${{fontSize:8,fontWeight:800,textTransform:"uppercase",letterSpacing:".5px",color:"var(--t3)",marginTop:1}}>Goal</div>
         <//>
       </div>
-      <!-- Quick stats strip -->
       <div style=${{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,padding:"14px 0 6px",borderTop:"1px solid var(--border)"}}>
         <div style=${{textAlign:"center"}}>
           <div style=${{fontFamily:"\"IBM Plex Mono\",monospace",fontSize:17,fontWeight:700,color:"var(--green)",letterSpacing:"-1px"}}>${money(totals.net)}</div>
@@ -1001,14 +998,12 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
       </div>`}
     </div>
 
-    <!-- CTA Button -->
     <div class="card-anim" style=${{marginBottom:16}}>
       <button class="cta-btn press-scale" onClick=${()=>setTab("add")}>
         <span style=${{fontSize:18}}>＋</span><span>New Job</span>
       </button>
     </div>
 
-    <!-- Quick Quote on Home Screen -->
     <div class="card-anim">
       <div class="section-label" style=${{marginTop:0,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
         <span>Quick Quote</span>
@@ -1025,7 +1020,6 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
       <${QuickQuote} form=${qqForm} settings=${settings} onApply=${qqApply} onFormChange=${qqChange} priceMode=${qqMode} setPriceMode=${setQqMode}/>
     </div>
 
-    <!-- Today strip -->
     ${todayJobs.length>0&&html`<div class="card-anim">
       <div class="section-label" style=${{marginTop:0}}>Today</div>
       <div class="mini-grid">
@@ -1036,13 +1030,11 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
       </div>
     </div>`}
 
-    <!-- Pending banner -->
     ${pendingJobs.length>0&&html`<div class="pending-banner card-anim press-scale" onClick=${()=>setTab("history")}>
       <div><div class="pending-banner-title">⏳ ${pendingJobs.length} Pending</div><div class="pending-banner-sub">${money(pendingTotal)} to collect</div></div>
       <span style=${{fontSize:12,fontWeight:700,color:"var(--gold)"}}>Collect →</span>
     </div>`}
 
-    <!-- Week goal card with progress bar -->
     <div class="card card-anim">
       <div class="card-pad">
         <div style=${{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -1061,7 +1053,6 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
       </div>
     </div>
 
-    <!-- Best Sellers -->
     ${top5Tires.length>0&&html`<div class="card-anim">
       <div class="section-label">Best Sellers</div>
       <div class="card">
@@ -1075,7 +1066,6 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
       </div>
     </div>`}
 
-    <!-- Lead Sources -->
     ${sources.length>0&&html`<div class="card-anim">
       <div class="section-label">Lead Sources</div>
       <div class="card"><div class="card-pad">
@@ -1087,7 +1077,6 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
       </div></div>
     </div>`}
 
-    <!-- Recent Jobs -->
     <div class="section-label card-anim">Recent Jobs</div>
     ${recent.length>0?html`<div class="stack">${recent.map((job,idx)=>{
       const profit=jobGrossProfit(job,settings);
@@ -1187,7 +1176,7 @@ function AddJob({onSave,settings,jobs,prefill,onClearPrefill,editJob,onClearEdit
       ${form.status==="Completed"&&html`<button class="btn blue press-scale" style=${{width:"100%",marginBottom:10}} onClick=${requestReview}>⭐ Send Review${form.customerPhone?" via SMS":""}</button>`}
       <div style=${{height:90}}/>
     </div>
-    <!-- BUG 1 FIX: Using arrays instead of <> fragments -->
+
     <div class="sticky-save">
       ${isEditing
         ?[html`<button key="cancel" class="btn secondary press-scale" onClick=${cancelEdit}>Cancel</button>`,html`<button key="save" class="btn primary press-scale" onClick=${()=>doSave(false)} disabled=${saving}>${saving?"Saving…":"Update Job ✓"}</button>`]
@@ -1659,7 +1648,7 @@ function App() {
       content=html`<${Inventory} inventory=${inventory} setInventory=${handleSetInventory} jobs=${jobs}/>`;
       break;
     case "settings":
-      content=html`<${Settings} settings=${settings} setSettings=${s=>{setSettings(s);}} jobs=${jobs} setJobs=${setJobs} inventory=${inventory} setInventory=${handleSetInventory} expenses=${expenses} onResetInventory=${resetInventoryFb}/>`;
+      content=html`<${Settings} settings=${settings} setSettings=${setSettings} jobs=${jobs} setJobs=${setJobs} inventory=${inventory} setInventory=${handleSetInventory} expenses=${expenses} onResetInventory=${resetInventoryFb}/>`;
       break;
   }
 
@@ -1668,7 +1657,7 @@ function App() {
     <div style=${{flex:1,overflow:"auto",WebkitOverflowScrolling:"touch"}}>${content}</div>
     <nav class="bottom-nav">
       ${TABS.map(t=>html`<button key=${t.id} class=${"nav-btn"+(tab===t.id?" active":"")} data-id=${t.id} onClick=${()=>setTab(t.id)}>
-        <span class="ico">${t.icon}</span>
+        ${t.id==="dashboard"?html`<img src=${LOGO_SRC} alt="" class="nav-logo-ico" style=${{width:22,height:22,objectFit:"contain",borderRadius:5,opacity:tab==="dashboard"?1:0.5,transition:"opacity .15s"}} onError=${e=>{e.target.style.display="none"}}/>`:html`<span class="ico">${t.icon}</span>`}
         <span>${t.label}</span>
       </button>`)}
     </nav>
