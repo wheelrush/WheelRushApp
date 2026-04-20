@@ -1262,223 +1262,255 @@ function Inventory({inventory, setInventory, jobs}) {
   const inv     = Array.isArray(inventory) ? inventory : [];
   const jobsArr = Array.isArray(jobs) ? jobs : [];
 
-  const [search,  setSearch]  = useState("");
-  const [editId,  setEditId]  = useState(null);
-  const [newRows, setNewRows] = useState([]);  // blank rows live here until saved
+  const [search, setSearch] = useState('');
+  const [editId, setEditId] = useState(null);
 
-  // Best sellers from job history
-  const bestSellers = useMemo(() => {
-    const c = {};
-    jobsArr.forEach(j => {
-      const s = (j.tireSize||"").trim();
-      if (s) c[s] = (c[s]||0) + 1;
+  // ── best sellers from job history ────────────────────────────────────────
+  const top5 = useMemo(function() {
+    const stats = {};
+    jobsArr.forEach(function(j) {
+      const s = (j.tireSize || '').trim();
+      if (!s) return;
+      if (!stats[s]) stats[s] = {size:s, jobs:0, qtySold:0, profit:0};
+      stats[s].jobs++;
+      stats[s].qtySold += Number(j.qty || 1);
+      stats[s].profit  += jobGrossProfit(j, {costPerMile:0.65});
     });
-    return Object.keys(c).sort((a,b)=>c[b]-c[a]).slice(0,5);
+    return Object.values(stats)
+      .sort(function(a,b){ return b.jobs !== a.jobs ? b.jobs - a.jobs : b.profit - a.profit; })
+      .slice(0, 5);
   }, [jobsArr]);
+  const bestSellers = top5.map(function(t){ return t.size; });
 
-  // ── helpers ──────────────────────────────────────────────────────────────
-  const fbWrite = (item) => {
-    if (!_db || !(item.size||"").trim()) return;
-    fbSet(invCol(), item.id, {
-      id: String(item.id), size: item.size.trim(),
-      qty: Number(item.qty||0), cost: Number(item.cost||0), notes: String(item.notes||"")
-    });
+  // ── exact functions as specified ─────────────────────────────────────────
+  const sanitizeItem = function(i) {
+    return {
+      id:    String(i.id    || uid()),
+      size:  String(i.size  || ''),
+      qty:   Math.max(0, Number(i.qty  || 0)),
+      cost:  Number(i.cost  || 0),
+      notes: String(i.notes || ''),
+    };
   };
 
-  // ── new-row CRUD (purely local, no Firebase until saved) ─────────────────
-  const addBlankRow = () => {
-    const id = uid();
-    setNewRows(p => [{id, size:"", qty:1, cost:0, notes:""}, ...p]);
+  const add = function() {
+    const id      = uid();
+    const newItem = {id:id, size:'', qty:0, cost:0, notes:''};
+    setInventory(function(prev) {
+      const safe = Array.isArray(prev) ? prev : [];
+      const next = [newItem, ...safe];
+      persist(KEYS.inventory, next);
+      return next;
+    });
     setEditId(id);
   };
 
-  const patchNewRow = (id, patch) =>
-    setNewRows(p => p.map(r => r.id === id ? {...r, ...patch} : r));
-
-  const discardNewRow = (id) => {
-    setNewRows(p => p.filter(r => r.id !== id));
-    setEditId(prev => prev === id ? null : prev);
-  };
-
-  const saveNewRow = (id) => {
-    const row = newRows.find(r => r.id === id);
-    if (!row) return;
-    if (!(row.size||"").trim()) { alert("Enter a tire size first."); return; }
-    const item = sanitizeInvItem(row);
-    // 1. Add to main inventory
-    setInventory(prev => {
-      const arr  = Array.isArray(prev) ? prev : [];
-      const next = [item, ...arr.filter(i => i.id !== id)];
+  const update = function(id, patch) {
+    setInventory(function(prev) {
+      const safe = Array.isArray(prev) ? prev : [];
+      const next = safe.map(function(i) {
+        return i.id === id ? sanitizeItem({...i, ...patch}) : i;
+      });
       persist(KEYS.inventory, next);
-      return next;
-    });
-    // 2. Remove from newRows
-    setNewRows(p => p.filter(r => r.id !== id));
-    // 3. Close edit panel
-    setEditId(null);
-    // 4. Write to Firebase (outside any setter)
-    fbWrite(item);
-  };
-
-  // ── existing-item CRUD ────────────────────────────────────────────────────
-  const patchExisting = (id, patch) => {
-    setInventory(prev => {
-      const arr  = Array.isArray(prev) ? prev : [];
-      const next = arr.map(i => i.id === id ? sanitizeInvItem({...i,...patch}) : i);
-      persist(KEYS.inventory, next);
-      const changed = next.find(i => i.id === id);
-      if (changed && (changed.size||"").trim()) fbWrite(changed);
+      const item = next.find(function(i){ return i.id === id; });
+      if (item && item.size.trim() !== '' && _db) {
+        fbSet(invCol(), item.id, {
+          id:    item.id,
+          size:  item.size,
+          qty:   item.qty,
+          cost:  item.cost,
+          notes: item.notes,
+        });
+      }
       return next;
     });
   };
 
-  const removeExisting = (id) => {
-    if (!window.confirm("Remove this tire size?")) return;
-    setInventory(prev => {
-      const arr  = Array.isArray(prev) ? prev : [];
-      const next = arr.filter(i => i.id !== id);
+  const step = function(id, delta) {
+    setInventory(function(prev) {
+      const safe = Array.isArray(prev) ? prev : [];
+      const next = safe.map(function(i) {
+        return i.id === id
+          ? sanitizeItem({...i, qty: Math.max(0, (Number(i.qty)||0) + delta)})
+          : i;
+      });
+      persist(KEYS.inventory, next);
+      const item = next.find(function(i){ return i.id === id; });
+      if (item && item.size.trim() !== '' && _db) {
+        fbSet(invCol(), item.id, {
+          id:    item.id,
+          size:  item.size,
+          qty:   item.qty,
+          cost:  item.cost,
+          notes: item.notes,
+        });
+      }
+      return next;
+    });
+  };
+
+  const remove = function(id) {
+    if (!window.confirm('Remove?')) return;
+    setInventory(function(prev) {
+      const safe = Array.isArray(prev) ? prev : [];
+      const next = safe.filter(function(i){ return i.id !== id; });
       persist(KEYS.inventory, next);
       if (_db) fbDel(invCol(), id);
       return next;
     });
-    setEditId(prev => prev === id ? null : prev);
-  };
-
-  const stepQty = (id, delta) => {
-    setInventory(prev => {
-      const arr  = Array.isArray(prev) ? prev : [];
-      const next = arr.map(i => i.id === id
-        ? sanitizeInvItem({...i, qty: Math.max(0,(Number(i.qty)||0)+delta)}) : i);
-      persist(KEYS.inventory, next);
-      const changed = next.find(i => i.id === id);
-      if (changed && (changed.size||"").trim()) fbWrite(changed);
-      return next;
-    });
+    setEditId(function(prev){ return prev === id ? null : prev; });
   };
 
   // ── derived lists ─────────────────────────────────────────────────────────
-  const deduped   = useMemo(() => dedupeInventory(inv.filter(i=>(i.size||"").trim())), [inv]);
-  const totalQty  = deduped.reduce((s,i)=>s+Number(i.qty||0), 0);
-  const totalVal  = deduped.reduce((s,i)=>s+Number(i.qty||0)*Number(i.cost||0), 0);
-  const lowStock  = deduped.filter(i=>Number(i.qty||0)>0 && Number(i.qty||0)<=LOW_STOCK);
-  const outStock  = deduped.filter(i=>Number(i.qty||0)===0);
+  const deduped  = useMemo(function() {
+    return dedupeInventory(inv.filter(function(i){ return (i.size||'').trim(); }));
+  }, [inv]);
+  const totalQty = deduped.reduce(function(s,i){ return s + Number(i.qty||0); }, 0);
+  const totalVal = deduped.reduce(function(s,i){ return s + Number(i.qty||0)*Number(i.cost||0); }, 0);
+  const lowStock = deduped.filter(function(i){ return Number(i.qty||0)>0 && Number(i.qty||0)<=LOW_STOCK; });
+  const outStock = deduped.filter(function(i){ return Number(i.qty||0)===0; });
 
-  const searchLo  = search.trim().toLowerCase();
-  const filtered  = searchLo
-    ? [...newRows,...inv].filter(i=>(i.size||"").toLowerCase().includes(searchLo))
-    : [...newRows,...inv];
+  const searchLo = search.trim().toLowerCase();
+  const filtered = searchLo
+    ? inv.filter(function(i){ return (i.size||'').toLowerCase().includes(searchLo); })
+    : inv;
 
-  const sorted = [...filtered].sort((a,b) => {
-    const aN = newRows.some(r=>r.id===a.id), bN = newRows.some(r=>r.id===b.id);
-    if (aN&&!bN) return -1; if (!aN&&bN) return 1;
-    return (a.size||"").localeCompare(b.size||"");
+  const sorted = [...filtered].sort(function(a,b) {
+    const aSz = (a.size||'').trim(), bSz = (b.size||'').trim();
+    if (!aSz &&  bSz) return -1;
+    if ( aSz && !bSz) return 1;
+    const ai = bestSellers.indexOf(aSz), bi = bestSellers.indexOf(bSz);
+    if (ai!==-1 && bi===-1) return -1;
+    if (ai===-1 && bi!==-1) return 1;
+    if (ai!==-1 && bi!==-1) return ai - bi;
+    return aSz.localeCompare(bSz);
   });
 
   // ── render ────────────────────────────────────────────────────────────────
   return html`<div class="screen"><div class="page page-enter">
 
-    <!-- Stats -->
     <div class="kpi-grid three card-anim">
-      <div class="kpi"><div class="kpi-label">Total Tires</div><div class="kpi-value">${totalQty}</div><div class="kpi-sub">${deduped.length} sizes</div></div>
-      <div class="kpi"><div class="kpi-label">Stock Value</div><div class="kpi-value" style=${{fontSize:16}}>${money(totalVal)}</div><div class="kpi-sub">at cost</div></div>
-      <div class="kpi"><div class="kpi-label">Reorder</div><div class="kpi-value" style=${{fontSize:20,color:(outStock.length+lowStock.length)>0?"var(--amber)":"var(--t3)"}}>${outStock.length+lowStock.length}</div><div class="kpi-sub">sizes</div></div>
+      <div class="kpi">
+        <div class="kpi-label">Total Tires</div>
+        <div class="kpi-value">${totalQty}</div>
+        <div class="kpi-sub">${deduped.length} sizes</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Stock Value</div>
+        <div class="kpi-value" style=${{fontSize:16}}>${money(totalVal)}</div>
+        <div class="kpi-sub">at cost</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Reorder</div>
+        <div class="kpi-value" style=${{fontSize:20,color:(outStock.length+lowStock.length)>0?'var(--amber)':'var(--t3)'}}>${outStock.length+lowStock.length}</div>
+        <div class="kpi-sub">sizes</div>
+      </div>
     </div>
 
-    <!-- Alerts -->
-    ${(outStock.length>0||lowStock.length>0)&&html`<div style=${{background:"var(--s2)",border:"1px solid var(--border)",borderRadius:14,padding:"14px 18px",marginBottom:12}}>
+    ${(outStock.length>0||lowStock.length>0)&&html`<div style=${{background:'var(--s2)',border:'1px solid var(--border)',borderRadius:14,padding:'14px 18px',marginBottom:12}}>
       ${outStock.length>0&&html`<div style=${{marginBottom:lowStock.length>0?10:0}}>
-        <div style=${{fontSize:10,fontWeight:800,textTransform:"uppercase",letterSpacing:"1px",color:"var(--t3)",marginBottom:6}}>Out of Stock</div>
-        <div style=${{display:"flex",flexWrap:"wrap",gap:6}}>${outStock.map(i=>html`<span key=${i.id} style=${{background:"var(--s3)",color:"var(--t2)",padding:"4px 12px",borderRadius:999,fontSize:11,fontWeight:700}}>${i.size||"—"}</span>`)}</div>
+        <div style=${{fontSize:10,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>Out of Stock</div>
+        <div style=${{display:'flex',flexWrap:'wrap',gap:6}}>
+          ${outStock.map(function(i){ return html`<span key=${i.id} style=${{background:'var(--s3)',color:'var(--t2)',padding:'4px 12px',borderRadius:999,fontSize:11,fontWeight:700}}>${i.size||'—'}</span>`; })}
+        </div>
       </div>`}
       ${lowStock.length>0&&html`<div>
-        <div style=${{fontSize:10,fontWeight:800,textTransform:"uppercase",letterSpacing:"1px",color:"var(--t3)",marginBottom:6}}>Low Stock</div>
-        <div style=${{display:"flex",flexWrap:"wrap",gap:6}}>${lowStock.map(i=>html`<span key=${i.id} style=${{background:"var(--amber-dim)",color:"var(--amber)",padding:"4px 12px",borderRadius:999,fontSize:11,fontWeight:700}}>${(i.size||"—")} · ${i.qty}</span>`)}</div>
+        <div style=${{fontSize:10,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>Low Stock</div>
+        <div style=${{display:'flex',flexWrap:'wrap',gap:6}}>
+          ${lowStock.map(function(i){ return html`<span key=${i.id} style=${{background:'var(--amber-dim)',color:'var(--amber)',padding:'4px 12px',borderRadius:999,fontSize:11,fontWeight:700}}>${i.size} · ${i.qty}</span>`; })}
+        </div>
       </div>`}
     </div>`}
 
-    <!-- Search + Add -->
-    <div style=${{display:"flex",gap:8,marginBottom:12}}>
-      <input value=${search} onChange=${e=>setSearch(e.target.value)} placeholder="Search sizes…"
-        style=${{flex:1,background:"var(--s2)",border:"1px solid var(--border)",borderRadius:12,padding:"13px 16px",fontSize:15,outline:"none",color:"var(--t1)"}}/>
-      <button class="btn primary press-scale" style=${{flexShrink:0,padding:"13px 20px",fontSize:14,borderRadius:12}} onClick=${addBlankRow}>+ Add</button>
+    <div style=${{display:'flex',gap:8,marginBottom:12}}>
+      <input value=${search} onChange=${function(e){ setSearch(e.target.value); }}
+        placeholder="Search sizes…"
+        style=${{flex:1,background:'var(--s2)',border:'1px solid var(--border)',borderRadius:12,padding:'13px 16px',fontSize:15,outline:'none',color:'var(--t1)'}}/>
+      <button class="btn primary press-scale"
+        style=${{flexShrink:0,padding:'13px 20px',fontSize:14,borderRadius:12}}
+        onClick=${add}>+ Add</button>
     </div>
 
-    <!-- List -->
     ${sorted.length===0
       ? html`<${EmptyState} icon="🛞" title="No inventory" sub="Tap + Add to log a tire size."/>`
       : html`<div class="card card-anim">
-          ${sorted.map((item,idx) => {
-            const isNew     = newRows.some(r=>r.id===item.id);
-            const isEditing = editId===item.id;
+          ${sorted.map(function(item, idx) {
+            const isEditing = editId === item.id;
             const qty       = Number(item.qty||0);
-            const isLow     = qty>0 && qty<=LOW_STOCK;
-            const isOut     = qty===0;
-            const hasSz     = !!(item.size||"").trim();
-            const isBest    = bestSellers.includes(item.size||"");
+            const isLow     = qty > 0 && qty <= LOW_STOCK;
+            const isOut     = qty === 0;
+            const hasSz     = (item.size||'').trim() !== '';
+            const isBest    = bestSellers.includes(item.size||'');
 
-            return html`<div key=${item.id} style=${{borderBottom:idx<sorted.length-1?"1px solid var(--border2)":"none"}}>
+            return html`<div key=${item.id} style=${{borderBottom:idx<sorted.length-1?'1px solid var(--border2)':'none'}}>
 
-              <!-- Row summary -->
-              <div style=${{display:"flex",alignItems:"center",padding:"14px 18px",gap:12,cursor:"pointer",background:isNew?"rgba(79,142,247,.04)":"transparent"}}
-                onClick=${()=>setEditId(isEditing?null:item.id)}>
+              <div style=${{display:'flex',alignItems:'center',padding:'14px 18px',gap:12,cursor:'pointer'}}
+                onClick=${function(){ setEditId(isEditing ? null : item.id); }}>
                 <div style=${{flex:1,minWidth:0}}>
                   <div style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,fontSize:15,
-                    color:!hasSz?"var(--blue)":"var(--t1)",letterSpacing:"-.3px"}}>
+                    color:!hasSz?'var(--blue)':'var(--t1)',letterSpacing:'-.3px'}}>
                     ${!hasSz
-                      ? html`<span style=${{color:"var(--blue)"}}>New tire — tap to fill in</span>`
+                      ? html`<span style=${{color:'var(--blue)',fontWeight:600,fontSize:13}}>New — tap to enter size</span>`
                       : item.size}
                   </div>
-                  ${item.cost>0&&html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:2}}>Cost ${money(item.cost)}</div>`}
+                  ${item.cost>0&&html`<div style=${{fontSize:11,color:'var(--t3)',marginTop:2}}>Cost ${money(item.cost)}</div>`}
                 </div>
-                ${isBest&&hasSz&&html`<span style=${{fontSize:9,fontWeight:800,background:"var(--gold-dim)",color:"var(--gold)",borderRadius:999,padding:"3px 10px",flexShrink:0}}>BEST</span>`}
-                ${isOut&&hasSz&&html`<span style=${{fontSize:9,fontWeight:800,color:"var(--t3)",background:"var(--s3)",borderRadius:999,padding:"3px 10px",flexShrink:0}}>OUT</span>`}
-                ${isLow&&!isOut&&html`<span style=${{fontSize:9,fontWeight:800,color:"var(--amber)",background:"var(--amber-dim)",borderRadius:999,padding:"3px 10px",flexShrink:0}}>LOW</span>`}
-                ${isNew&&html`<span style=${{fontSize:9,fontWeight:800,color:"var(--blue)",background:"var(--blue-dim)",borderRadius:999,padding:"3px 10px",flexShrink:0}}>NEW</span>`}
-                ${!isNew&&html`<div style=${{display:"flex",alignItems:"center",background:"var(--s3)",borderRadius:10,overflow:"hidden",flexShrink:0}} onClick=${e=>e.stopPropagation()}>
-                  <button onClick=${()=>stepQty(item.id,-1)} style=${{background:"none",border:"none",width:36,height:36,fontSize:18,fontWeight:700,color:"var(--t2)",lineHeight:1}}>−</button>
-                  <div style=${{width:32,textAlign:"center",fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,fontSize:15,color:isOut?"var(--t3)":isLow?"var(--amber)":"var(--t1)"}}>${qty}</div>
-                  <button onClick=${()=>stepQty(item.id,1)} style=${{background:"none",border:"none",width:36,height:36,fontSize:18,fontWeight:700,color:"var(--t2)",lineHeight:1}}>+</button>
-                </div>`}
+                ${isBest&&hasSz&&html`<span style=${{fontSize:9,fontWeight:800,background:'var(--gold-dim)',color:'var(--gold)',borderRadius:999,padding:'3px 10px',flexShrink:0}}>BEST</span>`}
+                ${isOut&&hasSz&&html`<span style=${{fontSize:9,fontWeight:800,color:'var(--t3)',background:'var(--s3)',borderRadius:999,padding:'3px 10px',flexShrink:0}}>OUT</span>`}
+                ${isLow&&!isOut&&html`<span style=${{fontSize:9,fontWeight:800,color:'var(--amber)',background:'var(--amber-dim)',borderRadius:999,padding:'3px 10px',flexShrink:0}}>LOW</span>`}
+                <div style=${{display:'flex',alignItems:'center',background:'var(--s3)',borderRadius:10,overflow:'hidden',flexShrink:0}}
+                  onClick=${function(e){ e.stopPropagation(); }}>
+                  <button onClick=${function(){ step(item.id,-1); }}
+                    style=${{background:'none',border:'none',width:36,height:36,fontSize:18,fontWeight:700,color:'var(--t2)',lineHeight:1}}>−</button>
+                  <div style=${{width:32,textAlign:'center',fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,fontSize:15,
+                    color:isOut?'var(--t3)':isLow?'var(--amber)':'var(--t1)'}}>${qty}</div>
+                  <button onClick=${function(){ step(item.id,1); }}
+                    style=${{background:'none',border:'none',width:36,height:36,fontSize:18,fontWeight:700,color:'var(--t2)',lineHeight:1}}>+</button>
+                </div>
               </div>
 
-              <!-- Edit panel -->
-              ${(isEditing||(isNew&&!hasSz))&&html`<div style=${{padding:"12px 18px 16px",background:"var(--s2)",borderTop:"1px solid var(--border2)"}}>
-                <div class="field" style=${{marginBottom:10}}>
-                  <label>Tire Size</label>
+              ${isEditing&&html`<div style=${{padding:'12px 18px 16px',background:'var(--s2)',borderTop:'1px solid var(--border2)'}}>
+                <div style=${{marginBottom:10}}>
+                  <div style=${{fontSize:9,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>Tire Size</div>
                   <input
                     autoFocus=${true}
-                    value=${item.size||""}
-                    onChange=${e=> isNew ? patchNewRow(item.id,{size:e.target.value}) : patchExisting(item.id,{size:e.target.value})}
+                    value=${item.size||''}
+                    onChange=${function(e){ update(item.id, {size:e.target.value}); }}
                     placeholder="e.g. 225/55R17"
-                    style=${{border:"1.5px solid var(--blue)",borderRadius:10,padding:"12px 14px",fontSize:16,fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,outline:"none",width:"100%",background:"var(--s1)",color:"var(--t1)"}}
+                    style=${{border:'1.5px solid var(--blue)',borderRadius:10,padding:'12px 14px',fontSize:16,
+                      fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,outline:'none',
+                      width:'100%',background:'var(--s1)',color:'var(--t1)'}}
                   />
                 </div>
-                <div class="field-row" style=${{marginBottom:12}}>
-                  <div class="field" style=${{marginBottom:0}}>
-                    <label>Qty</label>
-                    <input type="number" min="0" value=${item.qty||""}
-                      onChange=${e=> isNew ? patchNewRow(item.id,{qty:Number(e.target.value||0)}) : patchExisting(item.id,{qty:Number(e.target.value||0)})}
-                      style=${{border:"1px solid var(--border)",borderRadius:10,padding:"11px 13px",fontSize:15,outline:"none",width:"100%",background:"var(--s1)",color:"var(--t1)"}}/>
+                <div style=${{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:12}}>
+                  <div>
+                    <div style=${{fontSize:9,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>Qty</div>
+                    <input type="number" min="0" value=${item.qty||''}
+                      onChange=${function(e){ update(item.id, {qty:Number(e.target.value||0)}); }}
+                      style=${{border:'1px solid var(--border)',borderRadius:10,padding:'11px 13px',fontSize:15,
+                        outline:'none',width:'100%',background:'var(--s1)',color:'var(--t1)'}}/>
                   </div>
-                  <div class="field" style=${{marginBottom:0}}>
-                    <label>Cost ($)</label>
-                    <input type="number" min="0" value=${item.cost||""}
-                      onChange=${e=> isNew ? patchNewRow(item.id,{cost:Number(e.target.value||0)}) : patchExisting(item.id,{cost:Number(e.target.value||0)})}
+                  <div>
+                    <div style=${{fontSize:9,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>Cost ($)</div>
+                    <input type="number" min="0" value=${item.cost||''}
+                      onChange=${function(e){ update(item.id, {cost:Number(e.target.value||0)}); }}
                       placeholder="0.00"
-                      style=${{border:"1px solid var(--border)",borderRadius:10,padding:"11px 13px",fontSize:14,outline:"none",width:"100%",background:"var(--s1)",color:"var(--t1)"}}/>
+                      style=${{border:'1px solid var(--border)',borderRadius:10,padding:'11px 13px',fontSize:14,
+                        outline:'none',width:'100%',background:'var(--s1)',color:'var(--t1)'}}/>
                   </div>
                 </div>
-                <div style=${{display:"flex",gap:8}}>
-                  ${isNew
-                    ? [html`<button key="save" class="btn primary press-scale" style=${{flex:1}} onClick=${()=>saveNewRow(item.id)}>Save Tire ✓</button>`,
-                       html`<button key="del" class="btn danger" style=${{padding:"15px 14px"}} onClick=${()=>discardNewRow(item.id)}>×</button>`]
-                    : [html`<button key="done" class="btn secondary press-scale" style=${{flex:1}} onClick=${()=>setEditId(null)}>Done</button>`,
-                       html`<button key="del" class="btn danger" style=${{padding:"15px 14px"}} onClick=${()=>removeExisting(item.id)}>×</button>`]}
+                <div style=${{display:'flex',gap:8}}>
+                  <button class="btn secondary press-scale" style=${{flex:1}}
+                    onClick=${function(){ setEditId(null); }}>Done ✓</button>
+                  <button class="btn danger" style=${{padding:'15px 14px'}}
+                    onClick=${function(){ remove(item.id); }}>Remove</button>
                 </div>
               </div>`}
+
             </div>`;
           })}
         </div>`}
+
   </div></div>`;
 }
 
