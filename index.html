@@ -783,9 +783,17 @@ function weekSummary(weekJobs,s) {
 function dedupeInventory(items) {
   const seen = {};
   (items||[]).filter(i=>(i.size||"").trim()).forEach(i => {
-    const key = i.size.toLowerCase().replace(/\s+/g,"");
-    if (!seen[key]) { seen[key]={...i}; }
-    else { seen[key].qty = Math.max(seen[key].qty, Number(i.qty||0)); if (!seen[key].cost && i.cost) seen[key].cost = i.cost; }
+    // Key on size + condition so New and Used of the same size stay separate
+    const cond = (String(i.condition||"").toLowerCase() === "used") ? "used" : "new";
+    const key = i.size.toLowerCase().replace(/\s+/g,"") + "|" + cond;
+    if (!seen[key]) {
+      seen[key] = {...i, qty: Number(i.qty||0)};
+    } else {
+      // Sum quantities across duplicate rows (same size + condition) so stats are accurate.
+      seen[key].qty += Number(i.qty||0);
+      // Keep the first non-empty cost we saw (stats use this for "Stock Value")
+      if (!seen[key].cost && i.cost) seen[key].cost = i.cost;
+    }
   });
   return Object.values(seen);
 }
@@ -810,7 +818,10 @@ function sanitizeJob(j) {
   };
 }
 function sanitizeInvItem(i) {
-  const cond = (i.condition === "Used") ? "Used" : "New";
+  i = i || {};
+  // Accept "new"/"New"/"NEW" and "used"/"Used"/"USED" — canonicalize to "New"/"Used"
+  const rawCond = String(i.condition || "").toLowerCase();
+  const cond = rawCond === "used" ? "Used" : "New";
   return {
     id:String(i.id||uid()),
     size:String(i.size||""),
@@ -819,8 +830,11 @@ function sanitizeInvItem(i) {
     condition:cond,
     qty:Math.max(0,Number(i.qty||0)),
     cost:Number(i.cost||0),
-    sellPrice:Number(i.sellPrice||0),
-    notes:String(i.notes||"")
+    sellPrice:Number(i.sellPrice||i.price||0),  // accept "price" alias on import
+    notes:String(i.notes||""),
+    treadDepth:String(i.treadDepth||""),       // e.g. "6/32" — used tires only
+    dotCode:String(i.dotCode||""),             // DOT manufacturing code
+    createdAt:Number(i.createdAt||Date.now()),
   };
 }
 const SVC_PHRASES = {"Tire Repair":"flat tire repair","Tire Replacement":"tire replacement","Tire Installation":"tire installation","Lug Nut Removal":"lug nut removal","Valve Stem Service":"valve stem service","Roadside Assistance":"roadside assistance"};
@@ -1489,6 +1503,12 @@ function AddJob({onSave,settings,jobs,inventory,prefill,onClearPrefill,editJob,o
             const norm = normalizeTireSize(form.tireSize||"");
             const matches = norm
               ? safeInv.filter(i => normalizeTireSize(i.size||"") === norm && Number(i.qty||0)>0)
+                       .sort((a,b)=>{
+                         const ac = String(a.condition||"").toLowerCase()==="used" ? 1 : 0;
+                         const bc = String(b.condition||"").toLowerCase()==="used" ? 1 : 0;
+                         if (ac !== bc) return ac - bc;
+                         return Number(b.qty||0) - Number(a.qty||0);
+                       })
               : [];
             if (!form.tireSize) {
               return html`<div style=${{fontSize:12,color:"var(--t3)",padding:"2px 2px 6px"}}>Enter tire size above to see matching stock.</div>`;
@@ -1501,7 +1521,10 @@ function AddJob({onSave,settings,jobs,inventory,prefill,onClearPrefill,editJob,o
               <div style=${{display:"flex",flexDirection:"column",gap:6}}>
                 ${matches.map(i => {
                   const sel = form.inventoryItemId === i.id;
-                  const sub = [i.brand,i.model].filter(s=>s&&s.trim()).join(" ") || (i.condition||"New");
+                  const condLo = String(i.condition||"").toLowerCase();
+                  const isUsed = condLo === "used";
+                  const sub = [i.brand,i.model].filter(s=>s&&s.trim()).join(" ");
+                  const tread = String(i.treadDepth||"").trim();
                   return html`<button key=${i.id} type="button" class="press-scale"
                     onClick=${()=>{
                       const changes={inventoryItemId:i.id};
@@ -1521,7 +1544,13 @@ function AddJob({onSave,settings,jobs,inventory,prefill,onClearPrefill,editJob,o
                       color:"var(--t1)", fontSize:13, cursor:"pointer", textAlign:"left"
                     }}>
                     <div style=${{flex:1,minWidth:0}}>
-                      <div style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,fontSize:13}}>${i.size}${i.condition==="Used"?" · Used":""}</div>
+                      <div style=${{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                        <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,fontSize:13}}>${i.size}</span>
+                        ${isUsed
+                          ? html`<span style=${{fontSize:9,fontWeight:800,color:"var(--amber)",background:"var(--amber-dim)",borderRadius:999,padding:"2px 7px",letterSpacing:".3px"}}>USED</span>`
+                          : html`<span style=${{fontSize:9,fontWeight:800,color:"var(--green)",background:"var(--green-dim,rgba(34,197,94,.12))",borderRadius:999,padding:"2px 7px",letterSpacing:".3px"}}>NEW</span>`}
+                        ${isUsed && tread && html`<span style=${{fontSize:10,fontWeight:700,color:"var(--amber)",fontFamily:'"IBM Plex Mono",monospace'}}>${tread}</span>`}
+                      </div>
                       ${sub && html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:2}}>${sub}</div>`}
                     </div>
                     <div style=${{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
@@ -1723,9 +1752,10 @@ function Inventory({inventory, setInventory, jobs, user}) {
   const [search,  setSearch]  = useState('');
   const [editId,  setEditId]  = useState(null);
   const [view,    setView]    = useState('list');   // 'list' | 'new'
+  const [tab,     setTab]     = useState('All');    // 'All' | 'New' | 'Used' | 'Low'
 
   // New Tire form state — separate from list, only lives while view==='new'
-  const EMPTY_NEW = {size:'',brand:'',model:'',condition:'New',qty:'1',cost:'',sellPrice:'',notes:''};
+  const EMPTY_NEW = {size:'',brand:'',model:'',condition:'New',qty:'1',cost:'',sellPrice:'',notes:'',treadDepth:'',dotCode:''};
   const [nt, setNt] = useState(EMPTY_NEW);
   const [ntError, setNtError] = useState('');
   const ntSizeRef = useRef(null);
@@ -1762,6 +1792,9 @@ function Inventory({inventory, setInventory, jobs, user}) {
       cost:      Number(item.cost || 0),
       sellPrice: Number(item.sellPrice || 0),
       notes:     String(item.notes || ''),
+      treadDepth:String(item.treadDepth || ''),
+      dotCode:   String(item.dotCode || ''),
+      createdAt: Number(item.createdAt || Date.now()),
     });
   }
 
@@ -1778,16 +1811,20 @@ function Inventory({inventory, setInventory, jobs, user}) {
     if (qtyRaw === '') { setNtError('Quantity is required.'); return; }
     if (qtyNum < 1) { setNtError('Quantity must be at least 1.'); return; }
 
+    const isUsed = nt.condition === 'Used';
     const item = {
-      id:        uid(),
-      size:      sz,
-      brand:     String(nt.brand || '').trim(),
-      model:     String(nt.model || '').trim(),
-      condition: nt.condition === 'Used' ? 'Used' : 'New',
-      qty:       qtyNum,
-      cost:      Number(nt.cost || 0),
-      sellPrice: Number(nt.sellPrice || 0),
-      notes:     String(nt.notes || '').trim(),
+      id:         uid(),
+      size:       sz,
+      brand:      String(nt.brand || '').trim(),
+      model:      String(nt.model || '').trim(),
+      condition:  isUsed ? 'Used' : 'New',
+      qty:        qtyNum,
+      cost:       Number(nt.cost || 0),
+      sellPrice:  Number(nt.sellPrice || 0),
+      notes:      String(nt.notes || '').trim(),
+      treadDepth: isUsed ? String(nt.treadDepth || '').trim() : '',
+      dotCode:    isUsed ? String(nt.dotCode || '').trim() : '',
+      createdAt:  Date.now(),
     };
 
     // add to inventory (top of list → shows immediately)
@@ -1858,14 +1895,51 @@ function Inventory({inventory, setInventory, jobs, user}) {
   const totalQty = deduped.reduce(function(s,i){ return s + Number(i.qty || 0); }, 0);
   const totalVal = deduped.reduce(function(s,i){ return s + Number(i.qty || 0) * Number(i.cost || 0); }, 0);
   const outStock = deduped.filter(function(i){ return Number(i.qty||0) === 0; });
+  const lowStock = deduped.filter(function(i){ const q=Number(i.qty||0); return q>0 && q<=2; });
 
-  const searchLo   = search.trim().toLowerCase();
-  const savedRows  = searchLo
-    ? inv.filter(function(i){
-        const blob = ((i.size||'')+' '+(i.brand||'')+' '+(i.model||'')).toLowerCase();
-        return blob.includes(searchLo);
-      })
-    : inv;
+  // ── search + tab pipeline ─────────────────────────────────────────────────
+  const searchLo = search.trim().toLowerCase();
+  const filtered = useMemo(function() {
+    // 1. text search across size/brand/model
+    let rows = searchLo
+      ? inv.filter(function(i){
+          const blob = ((i.size||'')+' '+(i.brand||'')+' '+(i.model||'')+' '+(i.notes||'')).toLowerCase();
+          return blob.includes(searchLo);
+        })
+      : inv.slice();
+    // 2. tab filter
+    if (tab === 'New') {
+      rows = rows.filter(function(i){ return String(i.condition||'').toLowerCase() !== 'used'; });
+    } else if (tab === 'Used') {
+      rows = rows.filter(function(i){ return String(i.condition||'').toLowerCase() === 'used'; });
+    } else if (tab === 'Low') {
+      rows = rows.filter(function(i){ const q=Number(i.qty||0); return q>0 && q<=2; });
+    }
+    return rows;
+  }, [inv, searchLo, tab]);
+
+  // ── group by size, then by condition (New first), sorted by sellPrice asc ──
+  const grouped = useMemo(function() {
+    const bySize = {};
+    filtered.forEach(function(i){
+      const sz = String(i.size||'').trim();
+      if (!sz) return;
+      if (!bySize[sz]) bySize[sz] = { new:[], used:[] };
+      const cond = String(i.condition||'').toLowerCase() === 'used' ? 'used' : 'new';
+      bySize[sz][cond].push(i);
+    });
+    // Sort sizes ascending (natural-ish), then each bucket by price asc
+    const sizes = Object.keys(bySize).sort(function(a,b){ return a.localeCompare(b, undefined, {numeric:true}); });
+    return sizes.map(function(sz){
+      const g = bySize[sz];
+      const sortByPrice = function(a,b){ return (Number(a.sellPrice||0) - Number(b.sellPrice||0)) || (Number(b.qty||0) - Number(a.qty||0)); };
+      g.new.sort(sortByPrice);
+      g.used.sort(sortByPrice);
+      return { size: sz, newRows: g.new, usedRows: g.used };
+    });
+  }, [filtered]);
+
+  const totalFilteredCount = filtered.length;
 
   // ── NEW TIRE SCREEN ───────────────────────────────────────────────────────
   if (view === 'new') {
@@ -1980,13 +2054,35 @@ function Inventory({inventory, setInventory, jobs, user}) {
         </div>`}
       </div>
 
+      ${nt.condition === 'Used' && html`<div style=${sectionTitle}>Used Details</div>
+      <div class="card card-anim" style=${{padding:'16px 18px',marginBottom:20}}>
+        <div style=${{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+          <div>
+            <div style=${{fontSize:10,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>Tread Depth</div>
+            <input
+              value=${nt.treadDepth||''}
+              onChange=${function(e){ ntPatch('treadDepth', e.target.value); }}
+              placeholder="6/32"
+              style=${{...inpMono}}/>
+          </div>
+          <div>
+            <div style=${{fontSize:10,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>DOT Code</div>
+            <input
+              value=${nt.dotCode||''}
+              onChange=${function(e){ ntPatch('dotCode', e.target.value); }}
+              placeholder="Optional"
+              style=${inpSt}/>
+          </div>
+        </div>
+      </div>`}
+
       <!-- Notes -->
       <div style=${sectionTitle}>Notes</div>
       <div class="card card-anim" style=${{padding:'16px 18px',marginBottom:20}}>
         <textarea
           value=${nt.notes}
           onChange=${function(e){ ntPatch('notes', e.target.value); }}
-          placeholder="DOT code, age, etc."
+          placeholder="Age, vendor, etc."
           rows="3"
           style=${{...inpSt, resize:'vertical', minHeight:76, fontFamily:'"IBM Plex Sans",sans-serif'}}></textarea>
       </div>
@@ -2080,12 +2176,32 @@ function Inventory({inventory, setInventory, jobs, user}) {
               outline:'none',width:'100%',background:'var(--s1)',color:'var(--t1)',fontFamily:'"IBM Plex Mono",monospace',fontWeight:700}}/>
         </div>
       </div>
+      ${String(item.condition||'').toLowerCase()==='used' && html`<div style=${{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+        <div>
+          <div style=${{fontSize:9,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>Tread Depth</div>
+          <input
+            value=${item.treadDepth || ''}
+            onChange=${function(e){ patchExisting(item.id,{treadDepth:e.target.value}); }}
+            placeholder="6/32"
+            style=${{border:'1px solid var(--border)',borderRadius:10,padding:'11px 13px',fontSize:14,
+              outline:'none',width:'100%',background:'var(--s1)',color:'var(--t1)',fontFamily:'"IBM Plex Mono",monospace',fontWeight:700}}/>
+        </div>
+        <div>
+          <div style=${{fontSize:9,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>DOT Code</div>
+          <input
+            value=${item.dotCode || ''}
+            onChange=${function(e){ patchExisting(item.id,{dotCode:e.target.value}); }}
+            placeholder="Optional"
+            style=${{border:'1px solid var(--border)',borderRadius:10,padding:'11px 13px',fontSize:14,
+              outline:'none',width:'100%',background:'var(--s1)',color:'var(--t1)'}}/>
+        </div>
+      </div>`}
       <div style=${{marginBottom:12}}>
         <div style=${{fontSize:9,fontWeight:800,textTransform:'uppercase',letterSpacing:'1px',color:'var(--t3)',marginBottom:6}}>Notes</div>
         <input
           value=${item.notes || ''}
           onChange=${function(e){ patchExisting(item.id,{notes:e.target.value}); }}
-          placeholder="DOT code, age, etc."
+          placeholder="Age, vendor, etc."
           style=${{border:'1px solid var(--border)',borderRadius:10,padding:'11px 13px',fontSize:14,
             outline:'none',width:'100%',background:'var(--s1)',color:'var(--t1)'}}/>
       </div>
@@ -2102,36 +2218,40 @@ function Inventory({inventory, setInventory, jobs, user}) {
     const isEditing = editId === item.id;
     const qty   = Number(item.qty || 0);
     const isOut = qty === 0;
+    const isLow = qty > 0 && qty <= 2;
     const hasSz = (item.size || '').trim() !== '';
-    const subline = [item.brand, item.model].filter(function(s){ return (s||'').trim(); }).join(' ');
-    const isUsed = item.condition === 'Used';
+    const subline = [item.brand, item.model].filter(function(s){ return (s||'').trim(); }).join(' ') || (item.condition==='Used'?'Unknown':'');
+    const isUsed = String(item.condition||'').toLowerCase() === 'used';
+    const tread  = String(item.treadDepth||'').trim();
+    const price  = Number(item.sellPrice||0);
 
     return html`<div key=${item.id} style=${{borderBottom:idx<total-1?'1px solid var(--border2)':'none'}}>
-      <div style=${{display:'flex',alignItems:'center',padding:'14px 18px',gap:12,cursor:'pointer'}}
+      <div style=${{display:'flex',alignItems:'center',padding:'12px 18px',gap:12,cursor:'pointer'}}
         onClick=${function(){ setEditId(isEditing ? null : item.id); }}>
         <div style=${{flex:1,minWidth:0}}>
-          <div style=${{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
-            <div style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,fontSize:15,color:'var(--t1)',letterSpacing:'-.3px'}}>
-              ${hasSz ? item.size : html`<span style=${{color:'var(--t3)',fontWeight:500,fontSize:13}}>—</span>`}
+          <div style=${{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+            <div style=${{fontSize:14,fontWeight:700,color:'var(--t1)',letterSpacing:'-.2px'}}>
+              ${subline || (isUsed?'Used tire':'Tire')}
             </div>
-            ${isUsed
-              ? html`<span style=${{fontSize:9,fontWeight:800,color:'var(--amber)',background:'var(--amber-dim)',borderRadius:999,padding:'2px 8px'}}>USED</span>`
-              : hasSz && html`<span style=${{fontSize:9,fontWeight:800,color:'var(--green)',background:'var(--green-dim,rgba(34,197,94,.12))',borderRadius:999,padding:'2px 8px'}}>NEW</span>`
-            }
+            ${isUsed && tread && html`<span style=${{fontSize:10,fontWeight:700,color:'var(--amber)',fontFamily:'"IBM Plex Mono",monospace'}}>${tread}</span>`}
           </div>
-          ${subline && html`<div style=${{fontSize:11,color:'var(--t3)',marginTop:2}}>${subline}</div>`}
-          ${!subline && Number(item.cost||0)>0 && html`<div style=${{fontSize:11,color:'var(--t3)',marginTop:2}}>Cost ${money(item.cost)}</div>`}
+          <div style=${{display:'flex',alignItems:'center',gap:8,marginTop:3,flexWrap:'wrap'}}>
+            ${price>0 && html`<span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,fontSize:13,color:'var(--t2)'}}>${money(price)} ea</span>`}
+            ${price>0 && html`<span style=${{fontSize:11,color:'var(--t3)'}}>•</span>`}
+            <span style=${{fontSize:11,color:'var(--t3)',fontWeight:600}}>Qty: <span style=${{color:isOut?'var(--red)':(isLow?'var(--amber)':'var(--t1)'),fontWeight:800,fontFamily:'"IBM Plex Mono",monospace'}}>${qty}</span></span>
+          </div>
         </div>
-        ${bestSellers.includes(item.size||'')&&hasSz&&html`<span style=${{fontSize:9,fontWeight:800,background:'var(--gold-dim)',color:'var(--gold)',borderRadius:999,padding:'3px 10px',flexShrink:0}}>BEST</span>`}
-        ${isOut&&hasSz&&html`<span style=${{fontSize:9,fontWeight:800,color:'var(--t3)',background:'var(--s3)',borderRadius:999,padding:'3px 10px',flexShrink:0}}>OUT</span>`}
+        ${isLow&&hasSz&&html`<span style=${{fontSize:9,fontWeight:800,color:'var(--amber)',background:'var(--amber-dim)',borderRadius:999,padding:'3px 9px',flexShrink:0,letterSpacing:'.3px'}}>LOW</span>`}
+        ${isOut&&hasSz&&html`<span style=${{fontSize:9,fontWeight:800,color:'var(--red)',background:'var(--red-dim)',borderRadius:999,padding:'3px 9px',flexShrink:0,letterSpacing:'.3px'}}>OUT</span>`}
+        ${bestSellers.includes(item.size||'')&&hasSz&&!isLow&&!isOut&&html`<span style=${{fontSize:9,fontWeight:800,background:'var(--gold-dim)',color:'var(--gold)',borderRadius:999,padding:'3px 9px',flexShrink:0}}>BEST</span>`}
         <div style=${{display:'flex',alignItems:'center',background:'var(--s3)',borderRadius:10,overflow:'hidden',flexShrink:0}}
           onClick=${function(e){ e.stopPropagation(); }}>
           <button onClick=${function(){ stepExisting(item.id,-1); }}
-            style=${{background:'none',border:'none',width:36,height:36,fontSize:18,fontWeight:700,color:'var(--t2)',lineHeight:1}}>−</button>
-          <div style=${{width:32,textAlign:'center',fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,fontSize:15,
+            style=${{background:'none',border:'none',width:34,height:34,fontSize:18,fontWeight:700,color:'var(--t2)',lineHeight:1}}>−</button>
+          <div style=${{width:30,textAlign:'center',fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,fontSize:14,
             color:isOut?'var(--t3)':'var(--t1)'}}>${qty}</div>
           <button onClick=${function(){ stepExisting(item.id,1); }}
-            style=${{background:'none',border:'none',width:36,height:36,fontSize:18,fontWeight:700,color:'var(--t2)',lineHeight:1}}>+</button>
+            style=${{background:'none',border:'none',width:34,height:34,fontSize:18,fontWeight:700,color:'var(--t2)',lineHeight:1}}>+</button>
         </div>
       </div>
       ${isEditing && renderEditPanel(item)}
@@ -2158,20 +2278,64 @@ function Inventory({inventory, setInventory, jobs, user}) {
     </div>`}
 
     <!-- search + add -->
-    <div style=${{display:'flex',gap:8,marginBottom:12}}>
+    <div style=${{display:'flex',gap:8,marginBottom:10}}>
       <input value=${search} onChange=${function(e){ setSearch(e.target.value); }}
-        placeholder="Search size, brand, model…"
+        placeholder="Search tire size..."
         style=${{flex:1,background:'var(--s2)',border:'1px solid var(--border)',borderRadius:12,padding:'13px 16px',fontSize:15,outline:'none',color:'var(--t1)'}}/>
       <button class="btn primary press-scale"
         style=${{flexShrink:0,padding:'13px 20px',fontSize:14,borderRadius:12}}
         onClick=${function(){ setNt(EMPTY_NEW); setNtError(''); setView('new'); }}>+ Add</button>
     </div>
 
-    <!-- SAVED ROWS -->
-    ${savedRows.length===0
-      ? html`<${EmptyState} icon="🛞" title="No inventory" sub="Tap + Add to log a tire."/>`
-      : html`<div class="card card-anim">
-          ${savedRows.map(function(item, idx){ return renderSavedRow(item, idx, savedRows.length); })}
+    <!-- tabs -->
+    <div style=${{display:'flex',gap:6,marginBottom:14,overflowX:'auto'}}>
+      ${[
+        {id:'All',  count:inv.filter(function(i){return (i.size||'').trim();}).length},
+        {id:'New',  count:inv.filter(function(i){return (i.size||'').trim() && String(i.condition||'').toLowerCase()!=='used';}).length},
+        {id:'Used', count:inv.filter(function(i){return (i.size||'').trim() && String(i.condition||'').toLowerCase()==='used';}).length},
+        {id:'Low',  count:lowStock.length},
+      ].map(function(t){
+        const active = tab===t.id;
+        return html`<button key=${t.id} type="button" class="press-scale"
+          onClick=${function(){ setTab(t.id); }}
+          style=${{
+            flex:'0 0 auto',
+            padding:'8px 14px', borderRadius:999,
+            border: active ? '1.5px solid var(--blue)' : '1px solid var(--border)',
+            background: active ? 'var(--blue-dim)' : 'var(--s2)',
+            color: active ? 'var(--blue)' : 'var(--t2)',
+            fontSize:12, fontWeight:700, cursor:'pointer',
+            display:'flex', alignItems:'center', gap:6,
+            whiteSpace:'nowrap',
+          }}>
+          ${t.id}
+          <span style=${{fontSize:10,opacity:.75,fontFamily:'"IBM Plex Mono",monospace',fontWeight:800}}>${t.count}</span>
+        </button>`;
+      })}
+    </div>
+
+    <!-- GROUPED LIST -->
+    ${totalFilteredCount===0
+      ? html`<${EmptyState} icon="🛞" title="No matching tires" sub=${search? "Try a different search." : "Tap + Add to log a tire."}/>`
+      : html`<div style=${{display:'flex',flexDirection:'column',gap:14}}>
+          ${grouped.map(function(grp){
+            return html`<div key=${grp.size} class="card card-anim" style=${{overflow:'hidden'}}>
+              <!-- size header -->
+              <div style=${{padding:'12px 18px',borderBottom:'1px solid var(--border2)',background:'var(--s2)'}}>
+                <div style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:800,fontSize:15,color:'var(--t1)',letterSpacing:'-.3px'}}>${grp.size}</div>
+              </div>
+
+              ${grp.newRows.length>0 && html`<div>
+                <div style=${{padding:'8px 18px 6px',fontSize:9,fontWeight:800,letterSpacing:'1px',color:'var(--green)',textTransform:'uppercase'}}>New</div>
+                ${grp.newRows.map(function(item, idx){ return renderSavedRow(item, idx, grp.newRows.length); })}
+              </div>`}
+
+              ${grp.usedRows.length>0 && html`<div>
+                <div style=${{padding:'8px 18px 6px',fontSize:9,fontWeight:800,letterSpacing:'1px',color:'var(--amber)',textTransform:'uppercase',borderTop:grp.newRows.length>0?'1px solid var(--border2)':'none'}}>Used</div>
+                ${grp.usedRows.map(function(item, idx){ return renderSavedRow(item, idx, grp.usedRows.length); })}
+              </div>`}
+            </div>`;
+          })}
         </div>`}
 
   </div></div>`;
@@ -2646,18 +2810,34 @@ function App() {
   },[user]);
 
   // ── Inventory handler ─────────────────────────────────────────────────────
+  // Canonical Firestore payload for an inventory item — used by every write site
+  const invPayload = x => ({
+    id:String(x.id),
+    size:String(x.size||""),
+    brand:String(x.brand||""),
+    model:String(x.model||""),
+    condition:String(x.condition||"New"),
+    qty:Number(x.qty||0),
+    cost:Number(x.cost||0),
+    sellPrice:Number(x.sellPrice||0),
+    notes:String(x.notes||""),
+    treadDepth:String(x.treadDepth||""),
+    dotCode:String(x.dotCode||""),
+    createdAt:Number(x.createdAt||Date.now()),
+  });
+
   const handleSetInventory=useCallback(updater=>{
     setInventory(prev=>{
       const prevArr=Array.isArray(prev)?prev:[];
       const raw=typeof updater==="function"?updater(prevArr):updater;
       const next=Array.isArray(raw)?raw:prevArr;
       persist(KEYS.inventory,next);
-      if(user && !isLocalUser(user) && invCol()) next.filter(x=>(x.size||"").trim()).forEach(x=>fbSet(invCol(),x.id,{id:String(x.id),size:String(x.size||""),brand:String(x.brand||""),model:String(x.model||""),condition:String(x.condition||"New"),qty:Number(x.qty||0),cost:Number(x.cost||0),sellPrice:Number(x.sellPrice||0),notes:String(x.notes||"")}));
+      if(user && !isLocalUser(user) && invCol()) next.filter(x=>(x.size||"").trim()).forEach(x=>fbSet(invCol(),x.id,invPayload(x)));
       return next;
     });
   },[user]);
 
-  const resetInventoryFb=useCallback(fresh=>{pendingRef.current=[];if(user && !isLocalUser(user) && invCol())fresh.forEach(x=>fbSet(invCol(),x.id,{id:String(x.id),size:String(x.size||""),brand:String(x.brand||""),model:String(x.model||""),condition:String(x.condition||"New"),qty:Number(x.qty||0),cost:Number(x.cost||0),sellPrice:Number(x.sellPrice||0),notes:String(x.notes||"")}));},[user]);
+  const resetInventoryFb=useCallback(fresh=>{pendingRef.current=[];if(user && !isLocalUser(user) && invCol())fresh.forEach(x=>fbSet(invCol(),x.id,invPayload(x)));},[user]);
   const handleRepeat  =useCallback(job=>{setPrefill(job);setTab("add");},[]);
   const handleEdit    =useCallback(job=>{setEditJob(job);setTab("add");},[]);
   const handleStartJob=useCallback(qqForm=>{setPrefill({...EMPTY_JOB(),...qqForm});setTab("add");},[]);
