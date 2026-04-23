@@ -60,7 +60,9 @@
   input,select,textarea { font-size:16px !important; color:var(--t1); }
   button { cursor:pointer; }
   .app { height:100%; display:flex; flex-direction:column; }
-  .screen { flex:1; overflow:auto; -webkit-overflow-scrolling:touch; background:var(--bg); }
+  /* .screen no longer owns scroll — App-level container at line 3174 does.
+     Nested scroll containers caused flicker on iOS during momentum scroll. */
+  .screen { background:var(--bg); min-height:100%; }
   .page { padding:20px 16px calc(120px + env(safe-area-inset-bottom)); }
 
   @keyframes fadeSlideUp { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
@@ -73,14 +75,19 @@
   @keyframes logoPulse  { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.55;transform:scale(.94)} }
   .syncing    { animation:pulse 1.4s infinite; }
   .logo-pulse { animation:logoPulse 2s ease-in-out infinite; }
-  .page-enter { animation:fadeSlideUp .35s cubic-bezier(.4,0,.2,1) both; }
-  .card-anim  { animation:fadeSlideUp .4s cubic-bezier(.4,0,.2,1) both; }
-  .card-anim:nth-child(1){animation-delay:.05s}
-  .card-anim:nth-child(2){animation-delay:.1s}
-  .card-anim:nth-child(3){animation-delay:.15s}
-  .card-anim:nth-child(4){animation-delay:.2s}
-  .card-anim:nth-child(5){animation-delay:.25s}
-  .card-anim:nth-child(6){animation-delay:.3s}
+  .page-enter { animation:fadeSlideUp .25s cubic-bezier(.4,0,.2,1) both; }
+  .card-anim  { animation:fadeSlideUp .28s cubic-bezier(.4,0,.2,1) both; }
+  .card-anim:nth-child(1){animation-delay:.02s}
+  .card-anim:nth-child(2){animation-delay:.05s}
+  .card-anim:nth-child(3){animation-delay:.08s}
+  .card-anim:nth-child(4){animation-delay:.10s}
+  .card-anim:nth-child(5){animation-delay:.12s}
+  .card-anim:nth-child(6){animation-delay:.14s}
+  .card-anim:nth-child(n+7){animation:none !important; opacity:1}
+  /* Respect OS-level reduced-motion to prevent flicker on sensitive devices */
+  @media (prefers-reduced-motion: reduce) {
+    .card-anim, .page-enter { animation:none !important; opacity:1 !important; transform:none !important; }
+  }
   .press-scale { transition:transform .1s,opacity .1s; }
   .press-scale:active { transform:scale(.96); opacity:.85; }
   .shimmer-text {
@@ -702,6 +709,7 @@ const DEFAULT_SETTINGS = {
   owner1Active:true, owner2Active:true, profitSplit1:50, profitSplit2:50,
   weeklyGoal:1200, taxRate:25, repairTarget:90, replacementTarget:110,
   skipThreshold:70, riskyMiles:25, costPerMile:0.65,
+  defaultTargetProfit:100,
   googleReviewUrl:"https://g.page/r/CfMRJkXrNBO5EBM/review",
   servicePricing: DEFAULT_SERVICE_PRICING,
   vehiclePricing: DEFAULT_VEHICLE_PRICING,
@@ -730,13 +738,28 @@ const monthlyFixed   = s => { const exps=Array.isArray(s.expenses)?s.expenses:[]
 // Single source of truth for "does this service use tires/materials that should be tracked?"
 // Used by validation, deduction gating, and UI visibility of the Tire Source section.
 const isTireMaterialService = svc => /replacement|installation/i.test(String(svc||""));
+// ── Distance premium (tiered) ────────────────────────────────────────────────
+// 0-10 mi:+$0 · 10-25 mi:+$15 · 25+ mi:+$35 (new tiered rule, replaces flat +$20>25)
+function distancePremium(miles) {
+  const m = Number(miles||0);
+  if (m <= 10) return 0;
+  if (m <= 25) return 15;
+  return 35;
+}
+
+// Urgency / difficulty premiums — safe against missing flags
 function premiums(j) {
+  if (!j) return 0;
   let p = 0;
-  if (j.emergency) p+=20; if (j.lateNight) p+=20;
-  if (j.highway) p+=15; if (j.weekend) p+=10;
-  if (Number(j.miles||0)>25) p+=20;
+  if (j.emergency) p += 20;
+  if (j.lateNight) p += 20;
+  if (j.highway)   p += 15;
+  if (j.weekend)   p += 10;
+  if (j.difficulty === "medium") p += 15;
+  if (j.difficulty === "high")   p += 30;
   return p;
 }
+
 function getServicePricing(service, s) {
   const sp = (s && s.servicePricing) || DEFAULT_SERVICE_PRICING;
   return sp[service] || DEFAULT_SERVICE_PRICING[service] || {enabled:true, basePrice:90, minProfit:60};
@@ -746,19 +769,73 @@ function getVehicleAddOn(vehicleType, s) {
   const v  = vp[vehicleType] || DEFAULT_VEHICLE_PRICING[vehicleType] || {addOnProfit:0};
   return Number(v.addOnProfit || 0);
 }
-function suggestedPrice(j,s) {
-  const direct    = jobDirectCost(j,s);
-  const svcRule   = getServicePricing(j.service, s);
-  const basePrice = Number(svcRule.basePrice || 90);
-  const minProfit = Number(svcRule.minProfit || 60);
-  const vehicleAdd= getVehicleAddOn(j.vehicleType, s);
-  const surcharge = premiums(j);
-  // Suggested = base + vehicle add-on + travel/tire/misc costs + surcharges
-  let price = basePrice + vehicleAdd + direct + surcharge;
-  // Enforce minimum profit rule: price must cover costs + minProfit + vehicleAdd
-  const floor = direct + minProfit + vehicleAdd + surcharge;
-  if (price < floor) price = floor;
-  return Math.ceil(price/5)*5;
+
+// ── ONE CENTRAL PRICING ENGINE ────────────────────────────────────────────────
+// Used by Quick Quote, Add Job, and anywhere else that computes a suggested price.
+// Returns full breakdown so UI can explain the number to the user.
+function calculateJobPricing(job, settings) {
+  const s = settings || {};
+  const j = job || {};
+  const costPerMile = Number(s.costPerMile || 0.65);
+
+  const miles       = Number(j.miles || 0);
+  const tireCost    = Number(j.tireCost || 0);
+  const miscCost    = Number(j.miscCost || 0);
+  const travelCost  = r2(miles * costPerMile);
+  const directCost  = r2(tireCost + miscCost + travelCost);
+  const revenue     = Number(j.revenue || 0);
+  const actualProfit= r2(revenue - directCost);
+
+  // Target profit: Settings.servicePricing[service].minProfit + vehicle add-on.
+  // Falls back to settings.defaultTargetProfit (or 100) for unknown services.
+  const svcRule    = getServicePricing(j.service, s);
+  const vehicleAdd = getVehicleAddOn(j.vehicleType, s);
+  const baseTarget = (svcRule && Number(svcRule.minProfit)) || Number(s.defaultTargetProfit || 100);
+  const targetProfit = baseTarget + vehicleAdd;
+
+  const distanceAdj   = distancePremium(miles);
+  const urgencyBase   = premiums(j);
+  const urgencyPremium= urgencyBase + distanceAdj;  // distance rolled into urgency total for display
+
+  // Suggested = direct cost + target profit + urgency (incl. distance)
+  const raw = directCost + targetProfit + urgencyPremium;
+  const suggestedPrice = Math.ceil(raw / 5) * 5;
+
+  // Premium = suggested + $20, rounded to nearest $5
+  const premiumPrice = Math.ceil((suggestedPrice + 20) / 5) * 5;
+
+  // Decision label: why is this price what it is?
+  const skip = Number(s.skipThreshold || 70);
+  let decisionLabel = "Take it";
+  let decisionType  = "take";
+  if (isTireMaterialService(j.service) && (j.tireSource === "Bought for this job") && tireCost <= 0) {
+    decisionLabel = "Missing tire cost";
+    decisionType  = "missing";
+  } else if (revenue > 0 && actualProfit < skip) {
+    decisionLabel = "Low margin — increase price";
+    decisionType  = "low";
+  } else if (distanceAdj >= 35) {
+    decisionLabel = "High distance — premium applied";
+    decisionType  = "distance";
+  } else if (revenue > 0 && actualProfit >= skip + 40) {
+    decisionLabel = "Strong profit — take it";
+    decisionType  = "strong";
+  } else if (revenue === 0) {
+    decisionLabel = "Estimated price";
+    decisionType  = "estimate";
+  }
+
+  return {
+    revenue, tireCost, miscCost, travelCost, directCost,
+    targetProfit, urgencyPremium, distanceAdj, baseTarget, vehicleAdd,
+    suggestedPrice, premiumPrice, actualProfit,
+    decisionLabel, decisionType,
+  };
+}
+
+// Back-compat wrapper — existing callers still get just the suggested number.
+function suggestedPrice(j, s) {
+  return calculateJobPricing(j, s).suggestedPrice;
 }
 function getWeekStart(d) {
   const dt = new Date(d+"T12:00:00"), day = dt.getDay();
@@ -1158,22 +1235,31 @@ function CityInput({value,onChange}) {
 function QuickQuote({form,settings,onApply,onFormChange,priceMode,setPriceMode}) {
   const customRef=useRef(null);
   const hasInputs=Number(form.miles||0)>0||Number(form.tireCost||0)>0||Number(form.miscCost||0)>0;
-  const directCost=jobDirectCost(form,settings);
-  const suggested=suggestedPrice(form,settings);
-  const svcRule=getServicePricing(form.service, settings);
-  const vehicleAdd=getVehicleAddOn(form.vehicleType, settings);
-  const premiumPrice=Math.ceil((directCost+Number(svcRule.basePrice||100)+vehicleAdd+Math.max(30,Number(svcRule.minProfit||60)*0.3)+premiums(form))/5)*5;
-  const prem=premiums(form);
-  const skip=Number(settings.skipThreshold||70);
-  const dispPrice=priceMode==="custom"?Number(form.revenue||0):(priceMode==="premium"?premiumPrice:suggested);
-  const profit=r2(dispPrice-directCost);
-  const decLabel=profit<skip?"Too Low":profit>=skip+40?"Strong Margin":"Take It";
-  const decCls=profit<skip?"low":"take";
-  // Calculation breakdown pieces
-  const basePrice = Number(svcRule.basePrice||90);
-  const travelCost = Math.round(Number(form.miles||0) * Number(settings.costPerMile||0.65) * 100) / 100;
-  const tireCost = Number(form.tireCost||0);
-  const miscCost = Number(form.miscCost||0);
+
+  // SINGLE SOURCE OF TRUTH — all numbers come from the engine.
+  const calc = calculateJobPricing(form, settings);
+  const { directCost, suggestedPrice:suggested, premiumPrice, urgencyPremium:prem,
+          travelCost, tireCost, miscCost, distanceAdj, vehicleAdd,
+          baseTarget, decisionLabel, decisionType } = calc;
+
+  const skip = Number(settings.skipThreshold||70);
+  // Displayed price depends on mode — but profit is always recomputed from the active price.
+  const dispPrice = priceMode==="custom" ? Number(form.revenue||0)
+                  : priceMode==="premium" ? premiumPrice
+                  : suggested;
+  const profit = r2(dispPrice - directCost);
+
+  // When user hasn't entered revenue, use engine decision. Otherwise classify against skip threshold.
+  const liveDec = priceMode==="custom" && Number(form.revenue||0)>0
+    ? (profit<skip ? {label:"Low margin — increase price", type:"low"}
+      : profit>=skip+40 ? {label:"Strong profit — take it", type:"strong"}
+      : {label:"Take it", type:"take"})
+    : { label: decisionLabel, type: decisionType };
+  // Map internal decision types → existing CSS badge classes
+  const badgeCls = liveDec.type==="low" || liveDec.type==="missing" ? "low"
+                 : liveDec.type==="strong" ? "take"
+                 : "take";
+
   const handleMode=(mode,price)=>{if(setPriceMode)setPriceMode(mode);onApply(price===""?"":String(price));if(mode==="custom")setTimeout(()=>customRef.current&&customRef.current.focus(),80);};
   const inpSt={background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.18)",borderRadius:8,padding:"8px 10px",color:"#fff",fontSize:15,outline:"none",width:"100%",fontFamily:'"IBM Plex Mono",monospace',fontWeight:600,textAlign:"center"};
   const lbl={fontSize:9,fontWeight:700,textTransform:"uppercase",letterSpacing:".6px",color:"var(--t2)",marginBottom:5,textAlign:"center"};
@@ -1195,12 +1281,12 @@ function QuickQuote({form,settings,onApply,onFormChange,priceMode,setPriceMode})
           <div style=${{textAlign:"center"}}><div style=${{fontSize:10,color:"var(--t3)",fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",marginBottom:2}}>Cost</div><div style=${{fontFamily:'"IBM Plex Mono",monospace',fontSize:15,fontWeight:700,color:"var(--t2)"}}>${money(directCost)}</div></div>
           <div style=${{width:1,background:"var(--border)"}}/>
           <div style=${{textAlign:"center"}}><div style=${{fontSize:10,color:"var(--t3)",fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",marginBottom:2}}>Profit</div><div style=${{fontFamily:'"IBM Plex Mono",monospace',fontSize:15,fontWeight:700,color:profit>=skip?"#4ade80":"#ef4444"}}>${money(profit)}</div></div>
-          ${prem>0&&html`<div style=${{width:1,background:"var(--border)"}}/><div style=${{textAlign:"center"}}><div style=${{fontSize:10,color:"var(--t3)",fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",marginBottom:2}}>Surcharge</div><div style=${{fontFamily:'"IBM Plex Mono",monospace',fontSize:15,fontWeight:700,color:"#fb923c"}}>+${money(prem)}</div></div>`}
+          ${prem>0&&html`<div style=${{width:1,background:"var(--border)"}}/><div style=${{textAlign:"center"}}><div style=${{fontSize:10,color:"var(--t3)",fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",marginBottom:2}}>Premium</div><div style=${{fontFamily:'"IBM Plex Mono",monospace',fontSize:15,fontWeight:700,color:"#fb923c"}}>+${money(prem)}</div></div>`}
         </div>
         ${priceMode!=="custom"&&html`<div style=${{fontSize:10,color:"var(--t3)",textAlign:"center",marginBottom:8,fontFamily:'"IBM Plex Mono",monospace',letterSpacing:".2px"}}>
-          ${"Base "+money(basePrice)}${travelCost>0?" + Travel "+money(travelCost):""}${tireCost>0?" + Tire "+money(tireCost):""}${miscCost>0?" + Misc "+money(miscCost):""}${vehicleAdd>0?" + Vehicle "+money(vehicleAdd):""}${prem>0?" + Surcharge "+money(prem):""}
+          ${"Target "+money(baseTarget)}${travelCost>0?" + Travel "+money(travelCost):""}${tireCost>0?" + Tire "+money(tireCost):""}${miscCost>0?" + Misc "+money(miscCost):""}${vehicleAdd>0?" + Vehicle "+money(vehicleAdd):""}${distanceAdj>0?" + Distance "+money(distanceAdj):""}${(prem-distanceAdj)>0?" + Urgency "+money(prem-distanceAdj):""}
         </div>`}
-        <span class=${"qq-dec-badge "+decCls}>${decLabel}</span>
+        <span class=${"qq-dec-badge "+badgeCls}>${liveDec.label}</span>
       </div>
       <div class="qq-apply-row">
         <button class=${"qq-apply-btn suggested press-scale"+(priceMode==="suggested"?" active-sel":"")} onClick=${()=>handleMode("suggested",suggested)}>${priceMode==="suggested"?"✓ ":""}${money(suggested)}<br/><span style=${{fontSize:10,opacity:.8}}>Suggested</span></button>
@@ -1274,12 +1360,9 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
   const qqApply=price=>setQqForm(p=>({...p,revenue:price}));
   const safeJobs=Array.isArray(jobs)?jobs:[];
   const today=TODAY(),thisWeek=getWeekStart(today);
-  const thisMonth=getMonthKey(today);
   const weekJobs=useMemo(()=>safeJobs.filter(j=>getWeekStart(j.date)===thisWeek),[safeJobs,thisWeek]);
-  const monthJobs=useMemo(()=>safeJobs.filter(j=>getMonthKey(j.date)===thisMonth),[safeJobs,thisMonth]);
   const todayJobs=useMemo(()=>safeJobs.filter(j=>j.date===today),[safeJobs,today]);
   const totals=useMemo(()=>weekSummary(weekJobs,settings),[weekJobs,settings]);
-  const monthly=useMemo(()=>monthSummary(monthJobs,settings),[monthJobs,settings]);
   const avgProfit=weekJobs.length?r2(totals.grossProfit/weekJobs.length):0;
   const goalPct=clamp((totals.grossProfit/(settings.weeklyGoal||1))*100,0,100);
   const jobsNeeded=avgProfit>0?Math.max(0,Math.ceil(((settings.weeklyGoal||0)-totals.grossProfit)/avgProfit)):"—";
@@ -1319,51 +1402,6 @@ function Dashboard({jobs,settings,setTab,onRepeat,inventory,onStartJob}) {
       ${goalPct>=100&&html`<div style=${{textAlign:"center",marginTop:12,animation:"scaleIn .4s ease"}}><span style=${{background:"var(--green-dim)",color:"var(--green)",padding:"6px 16px",borderRadius:999,fontSize:12,fontWeight:800,border:"1px solid rgba(34,197,94,.25)"}}>🎯 Weekly Goal Achieved!</span></div>`}
     </div>
 
-    <!-- ── MONTHLY BREAKDOWN ──────────────────────────────────────── -->
-    <div class="card card-anim" style=${{marginBottom:16,overflow:"hidden"}}>
-      <div style=${{padding:"12px 16px",background:"var(--s2)",borderBottom:"1px solid var(--border2)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-        <div>
-          <div style=${{fontSize:9,fontWeight:800,textTransform:"uppercase",letterSpacing:"1.4px",color:"var(--blue)"}}>This Month</div>
-          <div style=${{fontSize:13,color:"var(--t1)",fontWeight:700,marginTop:2}}>${monthLabel(thisMonth)}</div>
-        </div>
-        <div style=${{textAlign:"right"}}>
-          <div style=${{fontFamily:'"IBM Plex Mono",monospace',fontSize:18,fontWeight:800,color:monthly.net>=0?"var(--green)":"var(--red)",letterSpacing:"-.5px"}}>${money(monthly.net)}</div>
-          <div style=${{fontSize:9,color:"var(--t3)",fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",marginTop:2}}>Net Profit</div>
-        </div>
-      </div>
-      <div style=${{padding:"12px 16px"}}>
-        <div style=${{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:13}}>
-          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
-            <span style=${{color:"var(--t3)"}}>Revenue</span>
-            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--t1)"}}>${money(monthly.revenue)}</span>
-          </div>
-          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
-            <span style=${{color:"var(--t3)"}}>Jobs</span>
-            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--t1)"}}>${monthJobs.length}</span>
-          </div>
-          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
-            <span style=${{color:"var(--t3)"}}>Tire Cost</span>
-            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--red)"}}>−${money(monthly.tireCosts)}</span>
-          </div>
-          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
-            <span style=${{color:"var(--t3)"}}>Misc</span>
-            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--red)"}}>−${money(monthly.miscCosts)}</span>
-          </div>
-          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
-            <span style=${{color:"var(--t3)"}}>Travel</span>
-            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--red)"}}>−${money(monthly.travelCosts)}</span>
-          </div>
-          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
-            <span style=${{color:"var(--t3)"}}>Fixed</span>
-            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--red)"}}>−${money(monthly.fixed)}</span>
-          </div>
-        </div>
-        <div style=${{display:"flex",justifyContent:"space-between",padding:"10px 0 2px",marginTop:6,borderTop:"1px solid var(--border)"}}>
-          <span style=${{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",color:"var(--t3)"}}>Gross Profit</span>
-          <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:800,fontSize:14,color:monthly.grossProfit>=0?"var(--t1)":"var(--red)"}}>${money(monthly.grossProfit)}</span>
-        </div>
-      </div>
-    </div>
     <div class="card-anim" style=${{marginBottom:16}}><button class="cta-btn press-scale" onClick=${()=>setTab("add")}><span style=${{fontSize:18}}>＋</span><span>New Job</span></button></div>
     <div class="card-anim">
       <div class="section-label" style=${{marginTop:0,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
@@ -1488,6 +1526,22 @@ function AddJob({onSave,settings,jobs,inventory,prefill,onClearPrefill,editJob,o
   const useLastJob=()=>{if(!lastJob)return;setForm({...EMPTY_JOB(),service:lastJob.service,vehicleType:lastJob.vehicleType||"Car",area:lastJob.area,payment:lastJob.payment,source:lastJob.source||"Google",tireSize:lastJob.tireSize,tireCost:String(lastJob.tireCost||""),miscCost:String(lastJob.miscCost||""),miles:String(lastJob.miles||""),emergency:lastJob.emergency,lateNight:lastJob.lateNight,highway:lastJob.highway,weekend:lastJob.weekend});};
   const doSave=async(andAdd=false)=>{
     const rev=Number(form.revenue||0);if(!rev){setError("Enter the job price.");return;}
+
+    // Tire source validation (only for tire-material services like Replacement/Installation)
+    if (isTireMaterialService(form.service)) {
+      const src = form.tireSource;
+      const tcost = Number(form.tireCost || 0);
+      if (src === "Bought for this job" && tcost <= 0) {
+        setError("Enter tire cost for this job");
+        return;
+      }
+      // If user chose Inventory but didn't pick a specific row, require selection
+      if (src === "Inventory" && !form.inventoryItemId) {
+        setError("Select inventory tire");
+        return;
+      }
+    }
+
     if(form.tireSize){try{const p=load(KEYS.sizes,[]);persist(KEYS.sizes,[form.tireSize,...p.filter(s=>s!==form.tireSize)].slice(0,10));}catch{}}
     const entry=sanitizeJob({...form,id:editingId||uid(),qty:Number(form.qty||1),revenue:r2(rev),tireCost:r2(form.tireCost),miscCost:r2(form.miscCost),miles:r2(form.miles)});
     const result=await onSave(entry,isEditing?false:andAdd);setTick(t=>t+1);
@@ -1869,9 +1923,10 @@ function History({jobs,settings,onRepeat,onDelete,onEdit}) {
 }
 
 // ── Expenses ──────────────────────────────────────────────────────────────────
-function Expenses({expenses,setExpenses,jobs}) {
+function Expenses({expenses,setExpenses,jobs,settings}) {
   const safe=Array.isArray(expenses)?expenses:[];
   const safeJobs=Array.isArray(jobs)?jobs:[];
+  const safeSettings=settings||{};
   const [form,setForm]=useState({date:TODAY(),category:"Fuel",amount:"",note:""});
   const CATS=["Fuel","Oil/Fluids","Equipment Repair","Supplies","Food","Tolls/Parking","Other"];
   const setF=(k,v)=>setForm(p=>({...p,[k]:v}));
@@ -1879,20 +1934,29 @@ function Expenses({expenses,setExpenses,jobs}) {
   const remove=id=>{if(!window.confirm("Delete?"))return;setExpenses(prev=>(Array.isArray(prev)?prev:[]).filter(e=>e.id!==id));try{if(window.toast)window.toast("Expense removed","info");}catch(e){}};
   const total=safe.reduce((s,e)=>s+Number(e.amount||0),0);
   const thisWeek=getWeekStart(TODAY());
+  const thisMonth=getMonthKey(TODAY());
   const weekTotal=safe.filter(e=>getWeekStart(e.date||TODAY())===thisWeek).reduce((s,e)=>s+Number(e.amount||0),0);
+
+  // ── Monthly P&L (moved here from Dashboard) ─────────────────────────────
+  const monthJobs=useMemo(()=>safeJobs.filter(j=>getMonthKey(j.date)===thisMonth),[safeJobs,thisMonth]);
+  const monthly=useMemo(()=>monthSummary(monthJobs,safeSettings),[monthJobs,safeSettings]);
 
   // ── Material cost aggregation from jobs ─────────────────────────────────
   // Pulls tireCost + miscCost directly from each job. No manual entry needed.
   const matCost = useMemo(() => {
-    const out = { weekTire:0, weekMisc:0, weekTotal:0, allTire:0, allMisc:0, allTotal:0, weekJobs:[] };
+    const out = { weekTire:0, weekMisc:0, weekTotal:0, allTire:0, allMisc:0, allTotal:0, weekJobs:[], weekJobCount:0 };
     safeJobs.forEach(j => {
       const tire = Number(j.tireCost||0);
       const misc = Number(j.miscCost||0);
+      const inThisWeek = getWeekStart(j.date||TODAY()) === thisWeek;
+      // Count every job in the week, even ones with no material cost
+      if (inThisWeek) out.weekJobCount += 1;
+      // But only aggregate jobs that actually had materials
       if (tire === 0 && misc === 0) return;
       out.allTire  += tire;
       out.allMisc  += misc;
       out.allTotal += tire + misc;
-      if (getWeekStart(j.date||TODAY()) === thisWeek) {
+      if (inThisWeek) {
         out.weekTire  += tire;
         out.weekMisc  += misc;
         out.weekTotal += tire + misc;
@@ -1904,6 +1968,51 @@ function Expenses({expenses,setExpenses,jobs}) {
 
   return html`<div class="screen"><div class="page page-enter">
 
+    <!-- ── MONTHLY P&L (moved from Dashboard) ───────────────────── -->
+    ${monthJobs.length > 0 && html`<div class="card card-anim" style=${{marginBottom:14,overflow:"hidden"}}>
+      <div style=${{padding:"12px 16px",background:"var(--s2)",borderBottom:"1px solid var(--border2)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style=${{fontSize:9,fontWeight:800,textTransform:"uppercase",letterSpacing:"1.4px",color:"var(--blue)"}}>This Month</div>
+          <div style=${{fontSize:13,color:"var(--t1)",fontWeight:700,marginTop:2}}>${monthLabel(thisMonth)}</div>
+        </div>
+        <div style=${{textAlign:"right"}}>
+          <div style=${{fontFamily:'"IBM Plex Mono",monospace',fontSize:18,fontWeight:800,color:monthly.net>=0?"var(--green)":"var(--red)",letterSpacing:"-.5px"}}>${money(monthly.net)}</div>
+          <div style=${{fontSize:9,color:"var(--t3)",fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",marginTop:2}}>Net Profit</div>
+        </div>
+      </div>
+      <div style=${{padding:"12px 16px"}}>
+        <div style=${{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:13}}>
+          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
+            <span style=${{color:"var(--t3)"}}>Revenue</span>
+            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--t1)"}}>${money(monthly.revenue)}</span>
+          </div>
+          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
+            <span style=${{color:"var(--t3)"}}>Jobs</span>
+            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--t1)"}}>${monthJobs.length}</span>
+          </div>
+          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
+            <span style=${{color:"var(--t3)"}}>Tire Cost</span>
+            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--red)"}}>−${money(monthly.tireCosts)}</span>
+          </div>
+          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
+            <span style=${{color:"var(--t3)"}}>Misc</span>
+            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--red)"}}>−${money(monthly.miscCosts)}</span>
+          </div>
+          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
+            <span style=${{color:"var(--t3)"}}>Travel</span>
+            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--red)"}}>−${money(monthly.travelCosts)}</span>
+          </div>
+          <div style=${{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border2)"}}>
+            <span style=${{color:"var(--t3)"}}>Fixed</span>
+            <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:700,color:"var(--red)"}}>−${money(monthly.fixed)}</span>
+          </div>
+        </div>
+        <div style=${{display:"flex",justifyContent:"space-between",padding:"10px 0 2px",marginTop:6,borderTop:"1px solid var(--border)"}}>
+          <span style=${{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",color:"var(--t3)"}}>Gross Profit</span>
+          <span style=${{fontFamily:'"IBM Plex Mono",monospace',fontWeight:800,fontSize:14,color:monthly.grossProfit>=0?"var(--t1)":"var(--red)"}}>${money(monthly.grossProfit)}</span>
+        </div>
+      </div>
+    </div>`}
     <!-- ── Material Costs (auto from jobs) ─────────────────────────── -->
     <div class="section-label" style=${{marginTop:0}}>Material Costs (from jobs)</div>
     <div class="mini-grid card-anim" style=${{marginBottom:14}}>
@@ -1914,7 +2023,7 @@ function Expenses({expenses,setExpenses,jobs}) {
     </div>
     ${matCost.weekJobs.length > 0 && html`<div class="card card-anim" style=${{marginBottom:14,overflow:"hidden"}}>
       <div style=${{padding:"10px 16px",background:"var(--s2)",borderBottom:"1px solid var(--border2)",fontSize:10,fontWeight:800,textTransform:"uppercase",letterSpacing:"1px",color:"var(--t3)"}}>
-        This Week · ${matCost.weekJobs.length} job${matCost.weekJobs.length===1?"":"s"}
+        This Week · ${matCost.weekJobs.length} of ${matCost.weekJobCount} job${matCost.weekJobCount===1?"":"s"} with materials
       </div>
       ${[...matCost.weekJobs].sort((a,b)=>(b.date||"").localeCompare(a.date||"")).map((j,idx,arr)=>{
         const tire=Number(j.tireCost||0), misc=Number(j.miscCost||0);
@@ -3154,7 +3263,7 @@ function App() {
     case "add":       content=html`<${AddJob} onSave=${saveJob} settings=${settings} jobs=${jobs} inventory=${inventory} prefill=${prefill} onClearPrefill=${()=>setPrefill(null)} editJob=${editJob} onClearEdit=${()=>setEditJob(null)} saving=${saving} onSwitchToInventory=${()=>setTab("inventory")}/>`; break;
     case "history":   content=html`<${History} jobs=${jobs} settings=${settings} onEdit=${handleEdit} onDelete=${deleteJob} onRepeat=${handleRepeat}/>`; break;
     case "payouts":   content=html`<${Payouts} jobs=${jobs} settings=${settings}/>`; break;
-    case "expenses":  content=html`<${Expenses} expenses=${expenses} setExpenses=${handleSetExpenses} jobs=${jobs}/>`; break;
+    case "expenses":  content=html`<${Expenses} expenses=${expenses} setExpenses=${handleSetExpenses} jobs=${jobs} settings=${settings}/>`; break;
     case "inventory": content=html`<${Inventory} inventory=${inventory} setInventory=${handleSetInventory} jobs=${jobs} user=${user}/>`; break;
     case "settings":  content=html`<${Settings} settings=${settings} setSettings=${setSettings} jobs=${jobs} setJobs=${setJobs} inventory=${inventory} setInventory=${handleSetInventory} expenses=${expenses} setExpenses=${handleSetExpenses} onResetInventory=${resetInventoryFb}/>`; break;
     default: content=null;
