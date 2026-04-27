@@ -1380,6 +1380,15 @@ function CallCounter({jobsToday}) {
     const data = load(KEYS.calls, {});
     return Number(data[today] || 0);
   });
+  // Refresh from storage whenever a new job is saved for today (event from saveJob).
+  useEffect(() => {
+    const handler = () => {
+      const data = load(KEYS.calls, {});
+      setCalls(Number(data[today] || 0));
+    };
+    window.addEventListener("wr-calls-updated", handler);
+    return () => window.removeEventListener("wr-calls-updated", handler);
+  }, [today]);
   const update = (delta) => {
     const next = Math.max(0, calls + delta);
     setCalls(next);
@@ -1962,6 +1971,49 @@ function AddJob({onSave,settings,jobs,inventory,prefill,onClearPrefill,editJob,o
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
+// Hoisted out of History so it has a stable function identity across renders.
+// Previously defined inside History — every parent re-render created a new
+// component type, forcing React to unmount/remount every job row, which
+// retriggered the .card-anim fade for the whole list (visible flicker).
+function HistoryJobRow({job, settings, onEdit, onRepeat, onDelete, onMarkPaid}) {
+  const profit = jobGrossProfit(job, settings);
+  const profitCls = profit >= 70 ? "green" : profit >= 40 ? "orange" : "red";
+  const sendReview = () => openReviewSMS(job.customerPhone, (settings.googleReviewUrl||"").trim(), job.customerName, job.service, job.area);
+  // Parse inventoryUsed (may be JSON string from Firestore)
+  let invUsed = job.inventoryUsed;
+  if (typeof invUsed === "string") { try { invUsed = JSON.parse(invUsed); } catch { invUsed = null; } }
+  const short = Number(job.inventoryShortfall||0);
+  return html`<div style=${{background:"var(--s1)",borderRadius:"var(--r2)",overflow:"hidden",border:"1px solid var(--border)",boxShadow:"var(--sh-card)"}}>
+    <div style=${{padding:"15px 17px",display:"flex",alignItems:"flex-start",gap:12}}>
+      <div class="job-icon">🛞</div>
+      <div style=${{flex:1,minWidth:0}}>
+        <div class="job-title">${job.service||"Tire Service"}</div>
+        <div class="job-meta">${job.area||"Miami"} · ${job.date||""}${job.tireSize?" · "+job.tireSize:""}</div>
+        ${(job.customerName||job.customerPhone)&&html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:1}}>👤 ${job.customerName||""}${job.customerPhone?" · "+job.customerPhone:""}</div>`}
+        ${job.inventoryDeducted && invUsed && invUsed.size && html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:1}}>📦 From stock: ${invUsed.size}${invUsed.qty?" ×"+invUsed.qty:""}</div>`}
+        ${!job.inventoryDeducted && job.tireSource==="Bought for this job" && isTireMaterialService(job.service) && html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:1}}>🛒 Bought${job.tireVendor?" · "+job.tireVendor:""}${[job.tireBrand,job.tireModel].filter(s=>(s||"").trim()).length?" · "+[job.tireBrand,job.tireModel].filter(s=>(s||"").trim()).join(" "):""}</div>`}
+        ${!job.inventoryDeducted && job.tireSource==="Customer supplied" && isTireMaterialService(job.service) && html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:1}}>👤 Customer supplied tire</div>`}
+        ${short>0 && html`<div style=${{fontSize:11,color:"var(--amber)",marginTop:1,fontWeight:600}}>⚠ Short: ${short} tire${short===1?"":"s"}</div>`}
+        ${Number(job.tireCost||0)===0 && (job.tireSource==="Bought for this job") && isTireMaterialService(job.service) && html`<div style=${{fontSize:11,color:"var(--amber)",marginTop:1,fontWeight:600}}>⚠ Check tire cost</div>`}
+        <div style=${{marginTop:7,display:"flex",gap:6,flexWrap:"wrap"}}><span class=${"pill "+profitCls}>${money(profit)}</span>${job.status==="Pending"&&html`<span class="pill gold">Pending</span>`}</div>
+      </div>
+      <div style=${{textAlign:"right",flexShrink:0}}>
+        <div style=${{fontFamily:'"IBM Plex Mono",monospace',fontSize:18,fontWeight:700,color:"var(--t1)",letterSpacing:"-1px"}}>${money(job.revenue||0)}</div>
+        <div style=${{fontSize:10,color:"var(--t3)",marginTop:2}}>${job.payment||""}</div>
+      </div>
+    </div>
+    <div style=${{padding:"10px 17px 12px",borderTop:"1px solid var(--border2)",display:"flex",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}>
+      ${onEdit&&html`<button class="btn secondary xs press-scale" onClick=${()=>onEdit(job)}>✏️</button>`}
+      <button class="btn secondary xs press-scale" onClick=${()=>onRepeat(job)}>🔁</button>
+      <button class="btn blue xs press-scale" onClick=${()=>sendInvoice(job,settings)}>🧾</button>
+      <button class="btn secondary xs press-scale" onClick=${sendReview}>⭐</button>
+      ${job.status==="Pending"&&html`<button class="btn success xs press-scale" onClick=${()=>onMarkPaid(job)}>✓ Paid</button>`}
+      ${job.customerPhone&&html`<button class="btn secondary xs press-scale" onClick=${()=>window.open("tel:"+job.customerPhone)}>📞</button>`}
+      <button class="btn danger xs press-scale" onClick=${()=>onDelete(job.id)}>×</button>
+    </div>
+  </div>`;
+}
+
 function History({jobs,settings,onRepeat,onDelete,onEdit}) {
   const safeJobs=Array.isArray(jobs)?jobs:[];
   const [filter,setFilter]=useState("All");const [search,setSearch]=useState("");const [view,setView]=useState("weeks");
@@ -1978,43 +2030,6 @@ function History({jobs,settings,onRepeat,onDelete,onEdit}) {
   const weekGroups=useMemo(()=>groupByWeek(filtered),[filtered]);
   const handleDelete=id=>{if(!window.confirm("Delete this job?"))return;onDelete(id);};
   const markPaid=job=>{if(onEdit)onEdit({...job,status:"Completed"});};
-  const JobRow=({job})=>{
-    const profit=jobGrossProfit(job,settings);const profitCls=profit>=70?"green":profit>=40?"orange":"red";
-    const sendReview=()=>openReviewSMS(job.customerPhone,(settings.googleReviewUrl||"").trim(),job.customerName,job.service,job.area);
-    // Parse inventoryUsed (may be JSON string from Firestore)
-    let invUsed = job.inventoryUsed;
-    if (typeof invUsed === "string") { try { invUsed = JSON.parse(invUsed); } catch { invUsed = null; } }
-    const short = Number(job.inventoryShortfall||0);
-    return html`<div class="card-anim" style=${{background:"var(--s1)",borderRadius:"var(--r2)",overflow:"hidden",border:"1px solid var(--border)",boxShadow:"var(--sh-card)"}}>
-      <div style=${{padding:"15px 17px",display:"flex",alignItems:"flex-start",gap:12}}>
-        <div class="job-icon">🛞</div>
-        <div style=${{flex:1,minWidth:0}}>
-          <div class="job-title">${job.service||"Tire Service"}</div>
-          <div class="job-meta">${job.area||"Miami"} · ${job.date||""}${job.tireSize?" · "+job.tireSize:""}</div>
-          ${(job.customerName||job.customerPhone)&&html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:1}}>👤 ${job.customerName||""}${job.customerPhone?" · "+job.customerPhone:""}</div>`}
-          ${job.inventoryDeducted && invUsed && invUsed.size && html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:1}}>📦 From stock: ${invUsed.size}${invUsed.qty?" ×"+invUsed.qty:""}</div>`}
-          ${!job.inventoryDeducted && job.tireSource==="Bought for this job" && isTireMaterialService(job.service) && html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:1}}>🛒 Bought${job.tireVendor?" · "+job.tireVendor:""}${[job.tireBrand,job.tireModel].filter(s=>(s||"").trim()).length?" · "+[job.tireBrand,job.tireModel].filter(s=>(s||"").trim()).join(" "):""}</div>`}
-          ${!job.inventoryDeducted && job.tireSource==="Customer supplied" && isTireMaterialService(job.service) && html`<div style=${{fontSize:11,color:"var(--t3)",marginTop:1}}>👤 Customer supplied tire</div>`}
-          ${short>0 && html`<div style=${{fontSize:11,color:"var(--amber)",marginTop:1,fontWeight:600}}>⚠ Short: ${short} tire${short===1?"":"s"}</div>`}
-          ${Number(job.tireCost||0)===0 && (job.tireSource==="Bought for this job") && isTireMaterialService(job.service) && html`<div style=${{fontSize:11,color:"var(--amber)",marginTop:1,fontWeight:600}}>⚠ Check tire cost</div>`}
-          <div style=${{marginTop:7,display:"flex",gap:6,flexWrap:"wrap"}}><span class=${"pill "+profitCls}>${money(profit)}</span>${job.status==="Pending"&&html`<span class="pill gold">Pending</span>`}</div>
-        </div>
-        <div style=${{textAlign:"right",flexShrink:0}}>
-          <div style=${{fontFamily:'"IBM Plex Mono",monospace',fontSize:18,fontWeight:700,color:"var(--t1)",letterSpacing:"-1px"}}>${money(job.revenue||0)}</div>
-          <div style=${{fontSize:10,color:"var(--t3)",marginTop:2}}>${job.payment||""}</div>
-        </div>
-      </div>
-      <div style=${{padding:"10px 17px 12px",borderTop:"1px solid var(--border2)",display:"flex",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}>
-        ${onEdit&&html`<button class="btn secondary xs press-scale" onClick=${()=>onEdit(job)}>✏️</button>`}
-        <button class="btn secondary xs press-scale" onClick=${()=>onRepeat(job)}>🔁</button>
-        <button class="btn blue xs press-scale" onClick=${()=>sendInvoice(job,settings)}>🧾</button>
-        <button class="btn secondary xs press-scale" onClick=${sendReview}>⭐</button>
-        ${job.status==="Pending"&&html`<button class="btn success xs press-scale" onClick=${()=>markPaid(job)}>✓ Paid</button>`}
-        ${job.customerPhone&&html`<button class="btn secondary xs press-scale" onClick=${()=>window.open("tel:"+job.customerPhone)}>📞</button>`}
-        <button class="btn danger xs press-scale" onClick=${()=>handleDelete(job.id)}>×</button>
-      </div>
-    </div>`;
-  };
   return html`<div class="screen"><div class="page page-enter">
     <div style=${{marginBottom:12}}>
       <input value=${search} onChange=${e=>setSearch(e.target.value)} placeholder="Search jobs, tires, customers…" style=${{width:"100%",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:14,padding:"14px 18px",outline:"none",fontSize:15,color:"var(--t1)"}}/>
@@ -2042,9 +2057,9 @@ function History({jobs,settings,onRepeat,onDelete,onEdit}) {
                 ${t.fixed>0 && html`<div style=${{fontSize:10,color:t.net>=0?"var(--t3)":"var(--red)",marginTop:3,fontFamily:'"IBM Plex Mono",monospace'}}>net ${money(t.net)} <span style=${{color:"var(--t3)"}}>(−${money(t.fixed)} fixed)</span></div>`}
               </div>
             </div>
-            <div class="stack">${wkJobs.map(job=>html`<${JobRow} key=${job.id} job=${job}/>`)}</div>
+            <div class="stack">${wkJobs.map(job=>html`<${HistoryJobRow} key=${job.id} job=${job} settings=${settings} onEdit=${onEdit} onRepeat=${onRepeat} onDelete=${handleDelete} onMarkPaid=${markPaid}/>`)}</div>
           </div>`;})}</div>`
-        :html`<div class="stack">${filtered.map(job=>html`<${JobRow} key=${job.id} job=${job}/>`)}</div>`}
+        :html`<div class="stack">${filtered.map(job=>html`<${HistoryJobRow} key=${job.id} job=${job} settings=${settings} onEdit=${onEdit} onRepeat=${onRepeat} onDelete=${handleDelete} onMarkPaid=${markPaid}/>`)}</div>`}
 
   </div></div>`;
 }
@@ -3218,6 +3233,20 @@ function App() {
     try{
       const id=job.id||uid();
       const isNew=!job.id;
+
+      // Auto-bump the daily call counter when a NEW job is logged for today.
+      // Editing an existing job, or backdating, does not increment.
+      if (isNew && job.date === TODAY()) {
+        try {
+          const t = TODAY();
+          const data = load(KEYS.calls, {});
+          data[t] = Math.max(Number(data[t]||0), 0) + 1;
+          persist(KEYS.calls, data);
+          // Dispatch a window event so the CallCounter on Dashboard refreshes its state.
+          window.dispatchEvent(new CustomEvent("wr-calls-updated"));
+        } catch(e) { /* non-fatal */ }
+      }
+
       const safeInventory=Array.isArray(inventory)?inventory:[];
       const safeJobs=Array.isArray(jobs)?jobs:[];
       const full={...job,id};
