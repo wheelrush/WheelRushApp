@@ -713,48 +713,30 @@ function planInventoryDeduction(inventory, tireSize, qtyNeeded, preferredId) {
 }
 
 // ── Apply a deduction plan to local state + Firebase ─────────────────────────
-function applyInventoryDeduction(plan, setInventory, user) {
+// ── Apply a deduction plan to inventory state ──────────────────────────────
+// Note: This function ONLY updates state. Firestore sync is handled by the
+// handleSetInventory wrapper in App which has correct field set + isLocalUser
+// guards. Pass handleSetInventory (NOT raw setInventory) as the second arg.
+function applyInventoryDeduction(plan, setInventory) {
   if (!plan || !Array.isArray(plan.plan) || plan.plan.length === 0) return;
   const byId = {};
   plan.plan.forEach(step => { byId[step.id] = step.after; });
   setInventory(prev => {
     const arr = Array.isArray(prev) ? prev : [];
-    const next = arr.map(i => byId[i.id] !== undefined ? {...i, qty: byId[i.id]} : i);
-    persist(KEYS.inventory, next);
-    if (user && invCol()) {
-      next.filter(x => byId[x.id] !== undefined).forEach(x => {
-        fbSet(invCol(), x.id, {
-          id:String(x.id), size:String(x.size||""), brand:String(x.brand||""), model:String(x.model||""),
-          condition: String(x.condition||"New"),
-          qty:Number(x.qty||0), cost:Number(x.cost||0), sellPrice:Number(x.sellPrice||0),
-          notes:String(x.notes||""),
-        });
-      });
-    }
-    return next;
+    return arr.map(i => byId[i.id] !== undefined ? {...i, qty: byId[i.id]} : i);
   });
 }
 
-// ── Restore a prior deduction (for job delete/undo) ──────────────────────────
-function restoreInventoryDeduction(deductions, setInventory, user) {
+// ── Restore a prior deduction (for job delete/undo/edit) ──────────────────
+// Same pattern: pass handleSetInventory so Firestore + localStorage sync
+// flow through one canonical write path.
+function restoreInventoryDeduction(deductions, setInventory) {
   if (!Array.isArray(deductions) || deductions.length === 0) return;
   const addMap = {};
   deductions.forEach(d => { addMap[d.id] = (addMap[d.id] || 0) + (Number(d.deducted) || 0); });
   setInventory(prev => {
     const arr = Array.isArray(prev) ? prev : [];
-    const next = arr.map(i => addMap[i.id] ? {...i, qty: (Number(i.qty)||0) + addMap[i.id]} : i);
-    persist(KEYS.inventory, next);
-    if (user && invCol()) {
-      next.filter(x => addMap[x.id]).forEach(x => {
-        fbSet(invCol(), x.id, {
-          id:String(x.id), size:String(x.size||""), brand:String(x.brand||""), model:String(x.model||""),
-          condition: String(x.condition||"New"),
-          qty:Number(x.qty||0), cost:Number(x.cost||0), sellPrice:Number(x.sellPrice||0),
-          notes:String(x.notes||""),
-        });
-      });
-    }
-    return next;
+    return arr.map(i => addMap[i.id] ? {...i, qty: (Number(i.qty)||0) + addMap[i.id]} : i);
   });
 }
 
@@ -3551,9 +3533,11 @@ function App() {
         }
       }
 
-      // Apply restore + deduct to real state
-      if (needsRestore) restoreInventoryDeduction(prevDeds, setInventory, user);
-      if (plan && Array.isArray(plan.plan) && plan.plan.length > 0) applyInventoryDeduction(plan, setInventory, user);
+      // Apply restore + deduct to real state.
+      // Use handleSetInventory (NOT setInventory) so localStorage + Firestore
+      // sync go through the canonical write path with full field set.
+      if (needsRestore) restoreInventoryDeduction(prevDeds, handleSetInventory);
+      if (plan && Array.isArray(plan.plan) && plan.plan.length > 0) applyInventoryDeduction(plan, handleSetInventory);
 
       if (plan) {
         deductions = Array.isArray(plan.plan) ? plan.plan : [];
@@ -3656,6 +3640,9 @@ function App() {
     finally{setSaving(false);}
     return { deductions, shortfall, sizeNormalized, foundAny };
   },[user,inventory,jobs]);
+  // Note: handleSetInventory is referenced inside but not in deps because it
+  // would cause TDZ — it's declared after saveJob. Safe because it only
+  // depends on `user`, which IS in saveJob's deps.
 
   // ── Expense handler (BUG 3 FIX) ──────────────────────────────────────────
   const handleSetExpenses=useCallback(updater=>{
@@ -3717,18 +3704,19 @@ function App() {
     const safeJobs=Array.isArray(jobs)?jobs:[];
     const targetJob=safeJobs.find(j=>j.id===id);
     let didRestore = false;
-    // Restore inventory (only once per id)
+    // Restore inventory (only once per id). Uses handleSetInventory so the
+    // canonical write path handles localStorage + Firestore sync with full fields.
     if(targetJob&&targetJob.inventoryDeducted&&!restoredOnceRef.current.has(id)){
       let deds=targetJob.inventoryDeductions;
       if(typeof deds==="string"){try{deds=JSON.parse(deds);}catch{deds=null;}}
       if(Array.isArray(deds)&&deds.length>0){
-        try{restoreInventoryDeduction(deds,setInventory,user);restoredOnceRef.current.add(id);didRestore=true;}catch(e){console.warn("restore:",e);}
+        try{restoreInventoryDeduction(deds,handleSetInventory);restoredOnceRef.current.add(id);didRestore=true;}catch(e){console.warn("restore:",e);}
       }
     }
     setJobs(prev=>{const arr=Array.isArray(prev)?prev:[];const next=arr.filter(j=>j.id!==id);persist(KEYS.jobs,next);return next;});
     if(_db && user && !isLocalUser(user) && jobCol()) await fbDel(jobCol(),id);
     try { if (window.toast) window.toast(didRestore ? "Job deleted · Inventory restored" : "Job deleted", didRestore ? "success" : "info"); } catch(e){}
-  },[user,jobs]);
+  },[user,jobs,handleSetInventory]);
 
   // ── Loading ───────────────────────────────────────────────────────────────
   if(!authReady)return html`<div style=${{height:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"var(--bg)"}}>
